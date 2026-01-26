@@ -1,0 +1,57 @@
+Creative Commons Attribution-NonCommercial 4.0 International Public License
+
+Copyright (c) 2025 Kacper Kidała SP8ESA
+
+SUMMARY OF RIGHTS AND RESTRICTIONS:
+
+1. NONCOMMERCIAL USE ONLY
+   You may use, copy, and distribute this work for noncommercial purposes only.
+   NonCommercial means not primarily intended for or directed towards commercial
+   advantage or monetary compensation.
+
+2. YOU MUST:
+   - Give appropriate credit to Kacper Kidała SP8ESA and original authors
+   - Provide a link to this license
+   - Indicate if changes were made
+   - Not suggest the licensor endorses you or your use
+
+3. YOU CANNOT:
+   - Use this work for commercial purposes without explicit permission
+   - Sublicense the work
+   - Remove or alter the license and copyright notices
+
+4. NO WARRANTY
+   The work is provided "as-is" without warranties of any kind.
+   The licensor is not liable for any damages arising from use of this work.
+
+---
+
+Code generated with assistance from Claude Opus 4.5.
+
+For the full CC BY-NC 4.0 license, see:
+http://creativecommons.org/licenses/by-nc/4.0/
+
+================================================================================
+THIRD-PARTY LICENSES AND ACKNOWLEDGMENTS
+================================================================================
+
+This project uses the following third-party components:
+
+1. TinyUSB
+   Copyright (c) 2018-2021 Ha Thach (tinyusb.org)
+   License: MIT
+   https://github.com/hathach/tinyusb
+
+2. Raspberry Pi Pico SDK
+   Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+   License: BSD-3-Clause
+   https://github.com/raspberrypi/pico-sdk
+
+3. pico_sdk_import.cmake
+   Copyright (c) 2021 Raspberry Pi (Trading) Ltd.
+   License: BSD-3-Clause
+   This file is part of the Pico SDK and is used to integrate
+   the SDK into CMake-based projects.
+
+The above components retain their original licenses. The CC BY-NC 4.0
+license applies only to the original code written for this project.
