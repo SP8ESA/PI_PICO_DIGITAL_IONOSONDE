@@ -1,0 +1,18 @@
+build/
+*.elf
+*.uf2
+*.bin
+*.hex
+*.dis
+*.map
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# System
+.DS_Store
+Thumbs.db
