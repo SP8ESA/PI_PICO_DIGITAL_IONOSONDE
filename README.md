@@ -1,174 +1,345 @@
-# BPSK Ionosonde# BPSK Ionosonde# BPSK Ionosonde - Projekt Jonosondy
+# BPSK Digital Ionosonde# BPSK Ionosonde# BPSK Ionosonde# BPSK Ionosonde - Projekt Jonosondy
 
 
 
-**Raspberry Pi Pico-based digital ionosonde with BPSK modulation for ionospheric sounding.**
+A low-cost digital ionosonde based on Raspberry Pi Pico with BPSK modulation for ionospheric sounding. Successfully detects ionospheric echoes with O/X mode splitting.
 
 
 
-Low-cost ionosonde transmitter capable of detecting ionospheric echoes with ordinary/extraordinary ray splitting (O/X mode separation).Raspberry Pi Pico-based ionosonde transmitter with BPSK modulation.## Opis projektu
+![GUI Controller](img/gui.png)**Raspberry Pi Pico-based digital ionosonde with BPSK modulation for ionospheric sounding.**
 
 
 
-![GUI Controller](img/gui.png)
+## Overview
 
 
 
-## Hardware Setup## Hardware SetupProjekt zoptymalizowanej jonosondy opartej na modulacji BPSK (Binary Phase Shift Keying) dla Raspberry Pi Pico. System transmituje sondaż ionosfery na częstotliwości 7.022 MHz z sekwencją modulacji Barker-13.
+This project implements a complete ionosonde transmitter using a Raspberry Pi Pico microcontroller. The system generates BPSK-modulated pulses at HF frequencies and controls the RF chain timing for transmit/receive switching.Low-cost ionosonde transmitter capable of detecting ionospheric echoes with ordinary/extraordinary ray splitting (O/X mode separation).Raspberry Pi Pico-based ionosonde transmitter with BPSK modulation.## Opis projektu
+
+
+
+**Key achievement:** Real ionospheric echoes have been successfully received, showing ordinary and extraordinary wave splitting (O/X modes).
+
+
+
+## Hardware![GUI Controller](img/gui.png)
+
+
+
+### Block Diagram
+
+
+
+```## Hardware Setup## Hardware SetupProjekt zoptymalizowanej jonosondy opartej na modulacji BPSK (Binary Phase Shift Keying) dla Raspberry Pi Pico. System transmituje sondaż ionosfery na częstotliwości 7.022 MHz z sekwencją modulacji Barker-13.
+
+┌──────────────────────────────────────────────────────────────────────┐
+
+│  Raspberry Pi Pico (RP2040 @ 250 MHz)                                │
+
+│                                                                      │
+
+│  ┌──────────┐    ┌─────────┐    ┌────────────┐    ┌──────────┐      │```
+
+│  │ GP8-GP15 │───→│  8-bit  │───→│  2-stage   │───→│   T/R    │───→ ANT
+
+│  │  (PIO)   │    │ R-2R DAC│    │    PA      │    │  Switch  │      │┌─────────────────────────────────────────────────────────────────────────┐
+
+│  └──────────┘    └─────────┘    └────────────┘    └──────────┘      │
+
+│                                       │                │             ││  Raspberry Pi Pico (250MHz overclock)                                   │```## Cechy
+
+│                          GP4 (PA_EN) ─┘                │             │
+
+│                          GP3 (TR_SW) ──────────────────┘             ││  ┌──────────┐    ┌─────────┐    ┌────────────────┐    ┌─────────────┐  │
+
+│                          GP2 (RX_EN) ───────────────────────→ RX    │
+
+└──────────────────────────────────────────────────────────────────────┘│  │ GP8-GP15 │───→│ 8-bit   │───→│ 2-stage PA     │───→│ T/R Switch  │──→ Antenna┌─────────────────────────────────────────────────────────────┐
+
+```
+
+│  │ (R-2R)   │    │ R-2R DAC│    │ SBB5089Z +     │    │ PE42553B    │  │
+
+### Components
+
+│  └──────────┘    └─────────┘    │ RD01MUS2B 1.5W │    └─────────────┘  ││  Pico (250MHz)                                              │✅ **Modulacja BPSK** - binarna modulacja fazy z sekwencjami Barkera  
+
+| Component | Part Number | Function |
+
+|-----------|-------------|----------|│                                 └────────────────┘          │          │
+
+| MCU | Raspberry Pi Pico | Signal generation, timing control |
+
+| DAC | 8-bit R-2R Ladder | Digital to analog conversion (GP8-GP15) |│       GP4 (PA_EN) ─────────────────────┘                    │          ││  ┌──────────┐    ┌─────────┐    ┌──────────┐    ┌────────┐ │✅ **R-2R Ladder DAC** - 8-bitowy przetwornik cyfrowo-analogowy  
+
+| Driver | SBB5089Z | MMIC preamplifier stage |
+
+| Final PA | RD01MUS2B | 1.5W RF power MOSFET |│       GP3 (T/R SW) ─────────────────────────────────────────┘          │
+
+| T/R Switch | PE42553B | SPDT antenna switch |
+
+│       GP2 (RX_EN) ──────────────────────────────────────────→ RX (TODO)││  │ GP8-GP15 │───→│ 8-bit   │───→│  1.5W PA │───→│  T/R   │──→ Antenna✅ **PIO + DMA** - precyzyjne sterowanie wyjściem z wykorzystaniem PIO i DMA  
+
+### GPIO Pinout
+
+└─────────────────────────────────────────────────────────────────────────┘
+
+| Pin | Function | Description |
+
+|-----|----------|-------------|```│  │ (R-2R)   │    │ R-2R DAC│    │  Module  │    │ Switch │ │✅ **Harmonogram TX** - automatyczne ramki co 20 sekund  
+
+| GP2 | RX_EN | RX preamplifier enable (HIGH = ON) |
+
+| GP3 | TR_SW | T/R switch control (HIGH = TX, LOW = RX) |
+
+| GP4 | PA_EN | Power amplifier enable (HIGH = ON) |
+
+| GP8-GP15 | DAC | 8-bit R-2R DAC output |### Components│  └──────────┘    └─────────┘    └──────────┘    └────────┘ │✅ **Sterowanie GPIO** - sekwencyjne włączanie/wyłączanie wzmacniacza, przełącznika T/R i odbiornika  
+
+
+
+## Signal Generation
+
+
+
+The Pico generates BPSK-modulated signals using PIO and DMA for precise, jitter-free timing:| Component | Part Number | Description |│                                      │              │       │✅ **USB Debug** - raportowanie statusu przez USB  
+
+
+
+![Generated Signal](img/signal.png)|-----------|-------------|-------------|
+
+
+
+*Top: BPSK modulated carrier. Bottom: GPIO control signals for PA and T/R switch.*| MCU | Raspberry Pi Pico | RP2040 @ 250MHz |│       GP4 (PA_EN) ──────────────────┘              │       │✅ **Soft Phase Transitions** - wygładzone przejścia fazy między bitami  
+
+
+
+## Results| DAC | R-2R Ladder | 8-bit on GP8-GP15 |
+
+
+
+Ionospheric echoes showing O-mode and X-mode separation:| PA Stage 1 | SBB5089Z | MMIC driver amplifier |│       GP3 (T/R SW) ────────────────────────────────┘       │✅ **Fade-in/Fade-out** - amplitudowe wygładzanie na początkach/końcach
+
+
+
+![Ionospheric Echoes](img/echo.png)| PA Stage 2 | RD01MUS2B | 1.5W RF MOSFET final |
+
+
+
+*Reception via SDRplay RSPduo. Native Pico RX implementation is planned.*| T/R Switch | PE42553B | SPDT RF switch |│       GP2 (RX_EN) ─────────────────────────────────→ RX Preamp (TODO)
+
+
+
+## Features
+
+
+
+- **Modulation:** BPSK with selectable Barker codes (2, 3, 4, 5, 7, 11, 13)## Generated Signal└─────────────────────────────────────────────────────────────┘## Parametry TX
+
+- **Frequency:** Configurable, default 7.022 MHz
+
+- **Output:** ~1.5W via 2-stage amplifier
+
+- **Timing:** PIO + DMA for sample-accurate signal generation
+
+- **Control:** Python GUI with serial interfacePico generates BPSK modulated signal with GPIO control for PA and T/R switching:```
+
+- **GPIO Sequencing:** Precise T/R switch and PA timing control
+
+
+
+## TX Timing Sequence
+
+![Signal and GPIO timing](img/signal.png)| Parameter | Value | Jednostka |
+
+Each chip transmission follows this sequence:
 
 
 
 ```
 
-┌─────────────────────────────────────────────────────────────────────────┐
+Time:   -200us   -150us   -100us    0      [TX]    +10us   +40us   +60us## Ionospheric Echoes## Features|-----------|-------|-----------|
 
-│  Raspberry Pi Pico (250MHz overclock)                                   │```## Cechy
+          │        │        │       │                │        │       │
 
-│  ┌──────────┐    ┌─────────┐    ┌────────────────┐    ┌─────────────┐  │
+          ▼        ▼        ▼       ▼                ▼        ▼       ▼
 
-│  │ GP8-GP15 │───→│ 8-bit   │───→│ 2-stage PA     │───→│ T/R Switch  │──→ Antenna┌─────────────────────────────────────────────────────────────┐
+        RX OFF   TR→TX    PA ON   START           PA OFF   TR→RX   RX ON
 
-│  │ (R-2R)   │    │ R-2R DAC│    │ SBB5089Z +     │    │ PE42553B    │  │
-
-│  └──────────┘    └─────────┘    │ RD01MUS2B 1.5W │    └─────────────┘  ││  Pico (250MHz)                                              │✅ **Modulacja BPSK** - binarna modulacja fazy z sekwencjami Barkera  
-
-│                                 └────────────────┘          │          │
-
-│       GP4 (PA_EN) ─────────────────────┘                    │          ││  ┌──────────┐    ┌─────────┐    ┌──────────┐    ┌────────┐ │✅ **R-2R Ladder DAC** - 8-bitowy przetwornik cyfrowo-analogowy  
-
-│       GP3 (T/R SW) ─────────────────────────────────────────┘          │
-
-│       GP2 (RX_EN) ──────────────────────────────────────────→ RX (TODO)││  │ GP8-GP15 │───→│ 8-bit   │───→│  1.5W PA │───→│  T/R   │──→ Antenna✅ **PIO + DMA** - precyzyjne sterowanie wyjściem z wykorzystaniem PIO i DMA  
-
-└─────────────────────────────────────────────────────────────────────────┘
-
-```│  │ (R-2R)   │    │ R-2R DAC│    │  Module  │    │ Switch │ │✅ **Harmonogram TX** - automatyczne ramki co 20 sekund  
+```Recorded ionospheric reflections showing O-mode / X-mode splitting (ordinary and extraordinary rays):| Carrier Frequency | 7.022 | MHz |
 
 
 
-### Components│  └──────────┘    └─────────┘    └──────────┘    └────────┘ │✅ **Sterowanie GPIO** - sekwencyjne włączanie/wyłączanie wzmacniacza, przełącznika T/R i odbiornika  
+## Parameters
 
 
 
-| Component | Part Number | Description |│                                      │              │       │✅ **USB Debug** - raportowanie statusu przez USB  
+| Parameter | Default | Range | Description |![Ionospheric echo with O/X splitting](img/echo.png)- **TX**: BPSK modulation with Barker codes (2-13)| Modulation | BPSK Barker-13 | - |
 
-|-----------|-------------|-------------|
+|-----------|---------|-------|-------------|
 
-| MCU | Raspberry Pi Pico | RP2040 @ 250MHz |│       GP4 (PA_EN) ──────────────────┘              │       │✅ **Soft Phase Transitions** - wygładzone przejścia fazy między bitami  
+| Frequency | 7.022 MHz | 1-30 MHz | Carrier frequency |
 
-| DAC | R-2R Ladder | 8-bit on GP8-GP15 |
+| Bit Duration | 40 µs | 10-1000 µs | Duration of each BPSK bit |
 
-| PA Stage 1 | SBB5089Z | MMIC driver amplifier |│       GP3 (T/R SW) ────────────────────────────────┘       │✅ **Fade-in/Fade-out** - amplitudowe wygładzanie na początkach/końcach
+| Amplitude | 85% | 0-100% | DAC output level |*Currently received using RSPduo SDR. Native Pico RX is planned.*- **DAC**: 8-bit R-2R ladder on GP8-GP15| Bit Duration | 40 | μs |
 
-| PA Stage 2 | RD01MUS2B | 1.5W RF MOSFET final |
+| Modulation | BARKER13 | BARKER2-13 | Barker code selection |
 
-| T/R Switch | PE42553B | SPDT RF switch |│       GP2 (RX_EN) ─────────────────────────────────→ RX Preamp (TODO)
+| Chip Count | 2048 | 1-65535 | Number of chips per frame |
 
+| Chip Interval | 4975 µs | 100-100000 µs | Time between chip starts |
 
-
-## Generated Signal└─────────────────────────────────────────────────────────────┘## Parametry TX
-
-
-
-Pico generates BPSK modulated signal with GPIO control for PA and T/R switching:```
+| Frame Interval | 20000 ms | 1000-60000 ms | Auto-TX repetition rate |## Features- **PA**: 1.5W power amplifier with GPIO control| Chip Count | 2048 | - |
 
 
 
-![Signal and GPIO timing](img/signal.png)| Parameter | Value | Jednostka |
+## Getting Started
 
 
 
-## Ionospheric Echoes## Features|-----------|-------|-----------|
+### Build Firmware- **TX**: BPSK modulation with Barker codes (2-13)- **T/R Switch**: Antenna relay for TX/RX switching| Chip S2S | 4975 | μs |
 
 
 
-Recorded ionospheric reflections showing O-mode / X-mode splitting (ordinary and extraordinary rays):| Carrier Frequency | 7.022 | MHz |
+```bash- **DAC**: 8-bit R-2R ladder on GP8-GP15
+
+cd build
+
+cmake ..- **PA**: 2-stage amplifier (SBB5089Z + RD01MUS2B) ~1.5W- **GUI**: Python Tkinter control panel| Frame Duration | ~10 | s |
+
+make
+
+```- **T/R Switch**: PE42553B SPDT for antenna switching
 
 
 
-![Ionospheric echo with O/X splitting](img/echo.png)- **TX**: BPSK modulation with Barker codes (2-13)| Modulation | BPSK Barker-13 | - |
+### Flash Pico- **GUI**: Python Tkinter control panel| Frame Interval | 20 | s |
 
 
 
-*Currently received using RSPduo SDR. Native Pico RX is planned.*- **DAC**: 8-bit R-2R ladder on GP8-GP15| Bit Duration | 40 | μs |
+```bash
+
+picotool load pico_digisonde.elf -fx
+
+```## Project Status## Status| TX Amplitude | 0.85 | (0..1) |
 
 
 
-## Features- **PA**: 1.5W power amplifier with GPIO control| Chip Count | 2048 | - |
+### Run GUI
 
 
 
-- **TX**: BPSK modulation with Barker codes (2-13)- **T/R Switch**: Antenna relay for TX/RX switching| Chip S2S | 4975 | μs |
+```bash- ✅ TX transmitter - implemented| System Clock | 250 | MHz |
 
-- **DAC**: 8-bit R-2R ladder on GP8-GP15
+pip install pyserial
 
-- **PA**: 2-stage amplifier (SBB5089Z + RD01MUS2B) ~1.5W- **GUI**: Python Tkinter control panel| Frame Duration | ~10 | s |
+python3 ionosonde_gui.py- ✅ GPIO sequencing - implemented  
 
-- **T/R Switch**: PE42553B SPDT for antenna switching
-
-- **GUI**: Python Tkinter control panel| Frame Interval | 20 | s |
-
-
-
-## Project Status## Status| TX Amplitude | 0.85 | (0..1) |
-
-
-
-- ✅ TX transmitter - implemented| System Clock | 250 | MHz |
-
-- ✅ GPIO sequencing - implemented  
+```
 
 - ✅ GUI controller - implemented- ✅ TX transmitter - implemented
 
+### Operation
+
 - ✅ Ionospheric echoes - confirmed!
 
-- ❌ RX receiver on Pico - TODO (currently using RSPduo)- ✅ GPIO sequencing - implemented  ## Piny GPIO
+1. Connect to serial port (typically `/dev/ttyACM0` on Linux)
+
+2. Adjust transmission parameters as needed- ❌ RX receiver on Pico - TODO (currently using RSPduo)- ✅ GPIO sequencing - implemented  ## Piny GPIO
+
+3. Click **Send Params** to upload settings
+
+4. Click **TX Once** for single transmission or **TX Auto** for continuous operation
 
 
 
-## GPIO Pinout- ✅ GUI controller - implemented
+## Serial Protocol## GPIO Pinout- ✅ GUI controller - implemented
 
 
 
-| GPIO | Function | Description |- ❌ RX receiver - TODO| GPIO | Funkcja | Opis |
+| Command | Description |
 
-|------|----------|-------------|
+|---------|-------------|
 
-| GP2 | RX_EN | RX preamp enable (1=ON) ||------|---------|------|
+| `TX_ONCE` | Transmit single frame || GPIO | Function | Description |- ❌ RX receiver - TODO| GPIO | Funkcja | Opis |
 
-| GP3 | T/R_SW | PE42553B control (1=TX, 0=RX) |
+| `TX_AUTO` | Start automatic transmission |
 
-| GP4 | PA_EN | PA enable (1=ON) |## GPIO Pinout| GP8-GP15 | R-2R DAC Output | 8-bitowy wyjście nośnej BPSK |
+| `TX_STOP` | Stop transmission ||------|----------|-------------|
 
-| GP8-15 | DAC | 8-bit R-2R output |
+| `STATUS` | Query current parameters |
 
-| GP2 | RX Enable | 1=RX ON, 0=RX OFF |
+| `SET FREQ=7.022,BIT_US=40,...` | Set parameters || GP2 | RX_EN | RX preamp enable (1=ON) ||------|---------|------|
+
+
+
+## Project Status| GP3 | T/R_SW | PE42553B control (1=TX, 0=RX) |
+
+
+
+- ✅ BPSK transmitter with PIO/DMA| GP4 | PA_EN | PA enable (1=ON) |## GPIO Pinout| GP8-GP15 | R-2R DAC Output | 8-bitowy wyjście nośnej BPSK |
+
+- ✅ GPIO sequencing for T/R and PA control
+
+- ✅ Python GUI controller| GP8-15 | DAC | 8-bit R-2R output |
+
+- ✅ Ionospheric echo reception confirmed
+
+- ⬜ Native RX receiver (planned)| GP2 | RX Enable | 1=RX ON, 0=RX OFF |
+
+- ⬜ Real-time ionogram display (planned)
 
 ## TX Sequence (per chip)
+
+## Files
 
 | GPIO | Function | Description || GP3 | T/R Switch | 1=TX, 0=RX |
 
 ```
 
-Time:  -200μs  -150μs  -100μs    0    [CHIP TX]   +10μs  +40μs  +60μs|------|----------|-------------|| GP4 | PA Enable | 1=PA ON, 0=PA OFF |
+├── main.c              # Main firmware```
 
-        │        │        │      │                  │       │       │
+├── bpsk_tx.c           # BPSK transmitter library
 
-        ▼        ▼        ▼      ▼                  ▼       ▼       ▼| GP2 | RX_EN | RX preamp enable (1=ON) |
+├── bpsk_tx.h           # Header fileTime:  -200μs  -150μs  -100μs    0    [CHIP TX]   +10μs  +40μs  +60μs|------|----------|-------------|| GP4 | PA Enable | 1=PA ON, 0=PA OFF |
 
-     RX OFF   T/R→TX   PA ON   START             PA OFF  T/R→RX  RX ON
+├── ionosonde_gui.py    # Python control GUI
 
-```| GP3 | T/R_SW | Antenna switch (1=TX, 0=RX) |## Architektura kodu
+├── CMakeLists.txt      # Build configuration        │        │        │      │                  │       │       │
+
+└── img/                # Documentation images
+
+```        ▼        ▼        ▼      ▼                  ▼       ▼       ▼| GP2 | RX_EN | RX preamp enable (1=ON) |
 
 
 
-## Quick Start| GP4 | PA_EN | 1.5W PA enable (1=ON) |
+## Requirements     RX OFF   T/R→TX   PA ON   START             PA OFF  T/R→RX  RX ON
 
 
 
-### 1. Flash Pico| GP8-15 | DAC | 8-bit R-2R output |### bpsk_tx.h / bpsk_tx.c
+- Raspberry Pi Pico```| GP3 | T/R_SW | Antenna switch (1=TX, 0=RX) |## Architektura kodu
 
-```bash
+- Pico SDK 2.x
+
+- Python 3.x with pyserial
+
+
+
+## License## Quick Start| GP4 | PA_EN | 1.5W PA enable (1=ON) |
+
+
+
+MIT
+
+
+
+## Author### 1. Flash Pico| GP8-15 | DAC | 8-bit R-2R output |### bpsk_tx.h / bpsk_tx.c
+
+
+
+SP8ESA```bash
+
 
 cd buildBiblioteka BPSK TX zawierająca:
 
