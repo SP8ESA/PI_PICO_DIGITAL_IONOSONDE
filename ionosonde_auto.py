@@ -1216,7 +1216,16 @@ def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
     session = os.path.join(cfg.out_dir, "rolling", f"rolling_{stamp}")
     raw_dir = os.path.join(session, "captures")
     os.makedirs(raw_dir, exist_ok=True)
-    stem = os.path.join(session, "ionogram")
+    # One file per sweep. The map is a rolling average, so every completed pass
+    # is a real observation of the ionosphere at that moment - overwriting a
+    # single file would throw all of them away but the last.
+    cur = {"stem": None, "pass": 0, "stamp": None}
+
+    def new_pass_file(n):
+        cur["pass"] = n
+        cur["stamp"] = datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
+        cur["stem"] = os.path.join(session, f"ionogram_p{n:03d}_{cur['stamp']}")
+        return cur["stem"]
 
     rec_cfg = copy.copy(cfg)
     rec_cfg.out_dir = raw_dir
@@ -1325,21 +1334,46 @@ def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
             f_hz, km_axis, M = roll.matrix()
             footer = roll.footer()
             newest = state["newest"]
-        if not np.isfinite(M).any():
+            stem = cur["stem"]
+            n = cur["pass"]
+        if stem is None or not np.isfinite(M).any():
             return
         subtitle = ig.fmt_stamp(newest)
+        head = f"{title} - pass {n}"
         try:
             png = ig.plot_ionogram(f_hz, km_axis, M, stem + ".png",
-                                   title=title, subtitle=subtitle, footer=footer)
+                                   title=head, subtitle=subtitle, footer=footer)
             ig.save_data(stem + ".npz", f_hz, km_axis, M,
-                         meta={"title": title, "subtitle": subtitle,
+                         meta={"title": head, "subtitle": subtitle,
                                "footer": footer, "depth": depth,
-                               "pass_chips": pass_chips})
+                               "pass_chips": pass_chips, "pass": n})
             state["png"] = png
             if on_update:
                 on_update(png)
         except Exception as e:
             log(f"   redraw failed: {type(e).__name__}: {e}")
+
+    def drain(timeout=600):
+        """Wait for everything already recorded to be folded in."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with cv:
+                left = len(pend) + state["busy"]
+            if left == 0:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def close_pass():
+        """Finish the current pass file so nothing can overwrite it later."""
+        if cur["stem"] is None:
+            return
+        progress(text=f"finishing pass {cur['pass']}")
+        drain()
+        dirty.clear()
+        redraw(final=True)
+        if state["png"]:
+            log(f"   pass {cur['pass']} saved: {os.path.basename(state['png'])}")
 
     def plotter():
         """One drawer, never more. Results that land while a plot is being
@@ -1368,8 +1402,11 @@ def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
     try:
         while not stopped and (passes_wanted == 0 or n_pass < passes_wanted):
             n_pass += 1
+            with roll_lock:
+                new_pass_file(n_pass)
             log(f"########## PASS {n_pass}"
-                f"{'' if passes_wanted == 0 else '/' + str(passes_wanted)} ##########")
+                f"{'' if passes_wanted == 0 else '/' + str(passes_wanted)} "
+                f"-> {os.path.basename(cur['stem'])}.png ##########")
             idx = 0
             while idx < len(freqs):
                 if stop_evt is not None and stop_evt.is_set():
@@ -1404,24 +1441,20 @@ def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
                 elif pico is not None and not pico.alive():
                     continue           # dead link: redo this very frequency
                 idx += 1
+            close_pass()
     finally:
         progress(text="finishing the analysis backlog")
         with cv:
             cv.notify_all()
-        deadline = time.time() + 600
-        while time.time() < deadline:
-            with cv:
-                left = len(pend) + state["busy"]
-            if left == 0:
-                break
-            time.sleep(0.2)
+        drain()
         quit_evt.set()
         with cv:
             cv.notify_all()
         for t in pool:
             t.join(timeout=30)
         drawer.join(timeout=60)
-        redraw(final=True)
+        dirty.clear()
+        redraw(final=True)          # an interrupted pass still keeps its map
         progress()
 
     log(f"=== rolling ionogram finished: {n_pass} pass(es), "
@@ -1431,7 +1464,13 @@ def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
     if state["dropped"]:
         log(f"    analysis could not keep up (peak backlog {state['peak_backlog']}): "
             f"raise --ion-workers, widen --ion-step-khz or lower --coh_batch")
-    log(f"    {state['png'] or stem + '.png'}")
+    import glob as _glob
+    maps = sorted(_glob.glob(os.path.join(session, "ionogram_p*.png")))
+    log(f"    {len(maps)} map(s) in {session}")
+    for m in maps[-3:]:
+        log(f"      {os.path.basename(m)}")
+    if len(maps) > 3:
+        log(f"      ... and {len(maps)-3} earlier")
     return state["png"]
 
 

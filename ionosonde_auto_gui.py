@@ -933,7 +933,9 @@ class AutoGUI:
         """
         meta = getattr(self, "_rolling_meta", None)
         stamp = datetime.utcnow().isoformat(timespec="seconds")
-        if meta is None or meta.get("folder") != folder:
+        # A new file means a new sweep: give it its own history row so the
+        # finished passes stay reachable instead of one row scrolling in place.
+        if meta is None or meta.get("png_path") != png:
             meta = {"kind": "ionogram", "rolling": True, "png_path": png,
                     "folder": folder, "utc": stamp, "n": 0}
             self._rolling_meta = meta
@@ -947,9 +949,11 @@ class AutoGUI:
         meta["png_path"] = png
         meta["utc"] = stamp
         meta["n"] = meta.get("n", 0) + 1
+        base = os.path.basename(png or "")
+        tag = base.split("_")[1] if base.startswith("ionogram_p") else "ROLLING"
         self.hist.delete(self._rolling_row)
         self.hist.insert(self._rolling_row,
-                         f"{stamp[11:19]}  ROLLING x{meta['n']}")
+                         f"{stamp[11:19]}  ROLLING {tag} x{meta['n']}")
         # only repaint the picture if the user is actually looking at it
         sel = self.hist.curselection()
         if not sel or sel[0] == self._rolling_row:
