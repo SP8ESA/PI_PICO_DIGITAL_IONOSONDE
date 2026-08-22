@@ -514,6 +514,12 @@ class AutoGUI:
                    width=12).pack(side=tk.LEFT, padx=2)
         ttk.Button(box3, text="Full screen (F11)",
                    command=self.toggle_fullscreen, width=14).pack(side=tk.LEFT, padx=2)
+        # Also in the View menu - but a Tk menubar is not mapped at all on some
+        # desktops, so the theme switch cannot live only there.
+        box4 = ttk.Frame(parent)
+        box4.pack(fill=tk.X, pady=(2, 0))
+        ttk.Checkbutton(box4, text="Dark theme", variable=self.vars['dark'],
+                        command=self._apply_theme).pack(side=tk.LEFT, padx=4)
         ttk.Button(parent, text="Open output folder",
                    command=self._open_dir).pack(fill=tk.X, pady=(2, 0))
 
