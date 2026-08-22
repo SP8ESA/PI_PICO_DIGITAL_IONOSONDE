@@ -169,9 +169,10 @@ maps.*
 ![Sporadic E and F together](img/ionogram_es_and_f.png)
 
 *2026-08-21 08:40 UTC, 5–7 MHz in 50 kHz steps. Both layers at once: sporadic E flat at
-110 km out to 5.85 MHz — thin enough to let the F echoes through — and the F trace from
-300 km at 5.55 MHz rising to 310 km at 6.4 MHz. Near 6.2 MHz the F trace splits into its
-O and X components, the X branch 50–65 km higher at 355–375 km.*
+110 km out to 5.85 MHz — thin enough to let the F echoes through — and the F trace split
+into its two magnetoionic branches: the O trace runs 5.57–5.92 MHz rising from 294 to
+312 km, the X trace picks up at 6.07 MHz and turns up into its cusp at 372 km by
+6.26 MHz.*
 
 ![Sporadic E](img/ionogram_es.png)
 
