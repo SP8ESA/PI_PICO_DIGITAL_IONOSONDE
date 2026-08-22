@@ -435,18 +435,6 @@ none of them is optional.
 └── img/                    # Measurement plots and documentation images
 ```
 
-## Project status
-
-- [x] BPSK transmitter with PIO/DMA
-- [x] GPIO sequencing for T/R and PA control
-- [x] Bench characterisation of the DDS, PA and sequencer
-- [x] Unattended TX/RX loop with transmitter watchdog
-- [x] Ionospheric echo reception, O/X splitting and second hop confirmed
-- [x] Swept ionograms and ionogram series
-- [ ] Harmonic filter between PA and antenna
-- [ ] Native RX receiver on the Pico
-- [ ] Automatic trace scaling (foF2, h'F) from the ionogram
-
 ## Requirements
 
 - Raspberry Pi Pico, Pico SDK 2.x
