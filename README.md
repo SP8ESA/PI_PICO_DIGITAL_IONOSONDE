@@ -158,17 +158,17 @@ the theoretical value for a 13-element Barker code is 20·log₁₀(13) = 22.3 d
 
 ### Ionograms
 
-![Ionogram 08:16Z](img/ionogram_0816z.png)
-![Ionogram 08:43Z](img/ionogram_0843z.png)
+![Ionogram 06:16 UTC](img/ionogram_0816z.png)
+![Ionogram 06:43 UTC](img/ionogram_0843z.png)
 
-*Two sweeps 27 minutes apart on the same morning (2026-08-22, 08:16 and 08:43 UTC). The
+*Two sweeps 27 minutes apart on the same morning (2026-08-22, 06:16 and 06:43 UTC). The
 F-region trace flattens near 300 km, then the critical frequency climbs as the layer
 ionises — the vertical cusp moves from about 6.0 MHz to about 6.6 MHz between the two
 maps.*
 
 ![Sporadic E and F together](img/ionogram_es_and_f.png)
 
-*2026-08-21 08:40 UTC, 5–7 MHz in 50 kHz steps. Both layers at once: sporadic E flat at
+*2026-08-21 06:40 UTC, 5–7 MHz in 50 kHz steps. Both layers at once: sporadic E flat at
 110 km out to 5.85 MHz — thin enough to let the F echoes through — and the F trace split
 into its two magnetoionic branches: the O trace runs 5.57–5.92 MHz rising from 294 to
 312 km, the X trace picks up at 6.07 MHz and turns up into its cusp at 372 km by
@@ -176,7 +176,7 @@ into its two magnetoionic branches: the O trace runs 5.57–5.92 MHz rising from
 
 ![Sporadic E](img/ionogram_es.png)
 
-*2026-08-21 17:39 UTC. A blanketing sporadic-E layer at 100 km reflecting from 5 to
+*2026-08-21 15:39 UTC. A blanketing sporadic-E layer at 100 km reflecting from 5 to
 7.2 MHz, with the second hop at 200 km and the third at 300 km stacked above it.*
 
 ## Signal generation
