@@ -13,6 +13,15 @@ __pycache__/
 .env
 venv/
 
+# Sounding output and local measurement data (kept on disk, not in git)
+captures/
+corr/example/
+corr/mod/
+corr/processed/
+corr/*.png
+corr/*.wav
+*.npz
+
 # System
 .DS_Store
 Thumbs.db
