@@ -166,6 +166,12 @@ F-region trace flattens near 300 km, then the critical frequency climbs as the l
 ionises — the vertical cusp moves from about 6.0 MHz to about 6.6 MHz between the two
 maps.*
 
+![Sporadic E and F together](img/ionogram_es_and_f.png)
+
+*2026-08-21 08:40 UTC, 5–7 MHz in 50 kHz steps. Both layers at once: sporadic E flat at
+110 km out to 5.9 MHz, and the F trace from 300 km at 5.55 MHz climbing to 315 km at
+6.4 MHz.*
+
 ![Sporadic E](img/ionogram_es.png)
 
 *2026-08-21 17:39 UTC. A blanketing sporadic-E layer at 100 km reflecting from 5 to
