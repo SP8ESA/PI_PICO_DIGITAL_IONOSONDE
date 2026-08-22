@@ -75,71 +75,55 @@ The DDS output measured open-circuit at the DAC, before the amplifier.
 
 ![Pulse rise](img/dds_open_rise.png)
 
-*Start of a pulse at 6 MHz. The envelope fades in over about 2 µs — no overshoot, no DC
-step, so the T/R switch never sees a hard edge.*
+*Start of a pulse, 6 MHz. Envelope fade-in ≈ 2 µs.*
 
 ![Phase flip](img/dds_open_phase_flip.png)
 
-*A code transition at 1 MHz, dotted trace = the unmodulated carrier for reference. The
-180° flip is spread over roughly 2 µs of soft phase instead of being switched in one
-sample, and the amplitude stays constant through it.*
+*Code transition, 1 MHz. Dotted trace = unmodulated carrier. Soft phase window ≈ 2 µs.*
 
 ![Barker-13 pulse](img/dds_open_pulse_barker13.png)
 
-*A whole chip at 1.5 MHz: 13 × 40 µs = 520 µs. The lower panel is the demodulated
-phase, and the recovered sign sequence is
-`+ + + + + − − + + − + − +` — Barker 13, exactly as transmitted.*
+*Whole chip, 1.5 MHz: 13 × 40 µs = 520 µs. Lower panel is the demodulated phase;
+recovered sequence `+ + + + + − − + + − + − +`.*
 
 ![Spectrum](img/dds_open_spectrum.png)
 
-*Spectrum of the same pulse at 10 MHz. Harmonics 2f₀…5f₀ are 45–53 dB below the carrier.
-The zoom around the carrier shows the sin(x)/x main lobe with its first nulls at
-±1/T_c = ±25 kHz for the 40 µs chip.*
+*Same pulse, 10 MHz. Harmonics 2f₀…5f₀ at −45 to −53 dB; first nulls of the main lobe at
+±1/T_c = ±25 kHz.*
 
 ### DDS output level and distortion (open circuit)
 
 ![DDS amplitude](img/dds_open_amplitude.png)
 ![DDS THD](img/dds_open_thd.png)
 
-Open-circuit amplitude falls from 1.34 V at 3 MHz to 0.57 V at 12 MHz — the roll-off of
-the R-2R ladder driving the probe capacitance. Distortion stays under 1 % up to 11 MHz
-and reaches 1.3 % at 12 MHz.
+*1.34 V at 3 MHz to 0.57 V at 12 MHz. THD below 1 % up to 11 MHz, 1.3 % at 12 MHz.*
 
 ### DDS into a 50 Ω load
 
 ![DDS power](img/dds_load_power_dbm.png)
 ![DDS THD into load](img/dds_load_thd.png)
 
-Loaded, the same source is far flatter: −12.3 dBm at 3 MHz to −13.1 dBm at 12 MHz, i.e.
-0.8 dB across the whole band. THD stays below 1 %.
+*−12.3 dBm at 3 MHz to −13.1 dBm at 12 MHz — 0.8 dB across the band. THD below 1 %.*
 
 ### Power amplifier into a 50 Ω load
 
 ![PA power](img/pa_load_power_dbm.png)
 ![PA THD](img/pa_load_thd.png)
 
-The two-stage PA delivers **32.0 dBm (1.6 W) flat within ±0.1 dB from 3 to 12 MHz** —
-44.6 dB of gain over the DDS measured at the same points.
-
-The price is distortion: 35 % THD at 3 MHz falling to 21 % at 12 MHz, which puts the
-harmonic content only 9–13 dB below the carrier. The stage runs deep in compression, so
-**a low-pass or band-pass filter belongs between the PA and the antenna** — the flat
-power curve is the useful part of this measurement, the THD curve is the warning that
-comes with it.
+*32.0 dBm (1.6 W), flat within ±0.1 dB from 3 to 12 MHz; 44.6 dB of gain over the DDS
+measured at the same points. THD 35 % at 3 MHz falling to 21 % at 12 MHz.*
 
 ### T/R sequencer
 
 ![Sequencer overview](img/sequencer_overview.png)
 
-*Five consecutive chips at the 5 ms chip interval, with RF, RX_EN, TR_SW and PA_EN on
-the same time base.*
+*Five consecutive chips at the 5 ms chip interval: RF, RX_EN, TR_SW and PA_EN on the same
+time base.*
 
 ![Sequencer zoom](img/sequencer_zoom.png)
 
-*One chip. RX_EN drops 200 µs before the pulse, the T/R switch goes to TX at −150 µs and
-the PA is enabled at −100 µs. The 520 µs of RF sits entirely inside that window, and the
-three signals release in reverse order afterwards, so the receiver is only re-enabled
-once the PA is off and the switch is back.*
+*One chip. RX_EN off at −200 µs, T/R to TX at −150 µs, PA on at −100 µs, 520 µs of RF,
+then the three signals release in reverse order.*
 
 The offsets are firmware constants and can be changed over the serial link:
 
@@ -192,14 +176,11 @@ maps.*
 The RP2040 runs at 250 MHz and the DAC is fed at the full system clock: a Q32 phase
 accumulator steps through a 1440-point sine LUT, PIO shifts the bytes out on GP8–GP15
 and DMA keeps it fed, so no interrupt or CPU stall can jitter a sample. Phase reversals
-and the pulse envelope are baked into the sample stream rather than switched in
-hardware, which is what the soft phase transition and the clean rise above show.
+and the pulse envelope are baked into the sample stream rather than switched in hardware.
 
 ## Software
 
 ![Automatic sounding GUI](img/gui_auto.png)
-
-Three programs, one chain:
 
 | File | Role |
 |------|------|
