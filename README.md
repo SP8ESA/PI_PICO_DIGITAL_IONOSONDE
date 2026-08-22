@@ -180,8 +180,7 @@ the theoretical value for a 13-element Barker code is 20·log₁₀(13) = 22.3 d
 *Two sweeps 27 minutes apart on the same morning (2026-08-22, 08:16 and 08:43 UTC). The
 F-region trace flattens near 300 km, then the critical frequency climbs as the layer
 ionises — the vertical cusp moves from about 6.0 MHz to about 6.6 MHz between the two
-maps. This is what an ionogram series is for: one map is a snapshot, the sequence is the
-ionosphere moving.*
+maps.*
 
 ![Sporadic E](img/ionogram_es.png)
 
@@ -259,31 +258,6 @@ successful analysis unless `--keep-wav` is given.
 | `--range-km` | 780 | Unambiguous radar range; the chip interval follows from it |
 | `--chip-overhead-us` | 250 | Per-chip firmware overhead added to the interval |
 | `--digital-agc` | **on** | RTL2832 digital AGC — the only gain that acts in direct sampling; `--no-digital-agc` turns it off |
-
-**There is no analog gain in direct sampling.** The R820T tuner is bypassed (the
-librtlsdr header puts it plainly: direct sampling activates "the IF mode of the
-RTL2832"), so the 0–49.6 dB tuner gain SoapySDR advertises does nothing — passing
-`--gain` in this mode only logs a warning. What is left is the RTL2832's own digital AGC,
-which rescales samples after the ADC: it changes the numbers, not the dynamic range. It
-is a real scalar, so it does not touch phase and does not break coherent integration;
-what it does cost is uneven weighting between pulses recorded at different gains, a
-distorted reading of the ADC-step diagnostic, and a short amplitude transient through the
-decimation filter at each gain step. Set the level in the RF chain instead — a pad when
-peaks reach the ADC ceiling, a preamp when the band noise sits on the quantisation floor.
-Every capture logs both in ADC steps (one step = 256 counts, full scale = 128 steps), so
-the decision is measurable.
-
-The real frame is `chips x (S2S + overhead)`, not `chips x S2S`: the firmware schedules
-every chip 150 µs ahead of the *current* time and adds its own per-chip housekeeping, so
-a frame always runs longer than configured. The overhead is learned from completed
-frames, so the first cycle only needs a rough starting guess. The `[TX-n] Completed`
-message is treated as an early-exit hint, not a dependency — a lost line costs 1.5 s,
-never a truncated recording, and the frame number is matched so a late message from an
-earlier frame cannot be mistaken for the current one.
-
-**All timestamps are UTC**, as is usual for ionospheric work: log lines carry a `Z`,
-capture and folder names are UTC, plots are labelled `UTC`, and each `.json` records both
-`utc` and `local`.
 
 ### Range, power and energy
 
