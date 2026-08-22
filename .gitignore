@@ -25,3 +25,6 @@ corr/*.wav
 # System
 .DS_Store
 Thumbs.db
+
+# Local test suite (kept on disk, not in git)
+tests/

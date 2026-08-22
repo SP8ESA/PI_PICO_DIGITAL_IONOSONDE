@@ -463,27 +463,20 @@ There is one detector and no switch for it: the band-isolating tracker above.
 | Chip interval | 4975 µs | Start-to-start time between chips |
 | Frame interval | 20000 ms | Auto-TX repetition rate |
 
-## Tests
-
-```bash
-python3 tests/run_all.py
-```
-
-Synthetic echoes at known ranges, the ionogram series, transmitter health and recovery
-against a simulated Pico, TX-only (with a tripwire that fails if anything opens the SDR)
-and a GUI smoke test. No hardware needed — the firmware is emulated over a pty.
-
 ## Files
 
+`ionosonde_auto_gui.py` is the only program you start; it imports the other three, so
+none of them is optional.
+
 ```
+├── ionosonde_auto_gui.py   # <- start here: GUI over the whole loop
+│   ├── ionosonde_auto.py   #    keys the Pico, records with the RTL-SDR, runs a sweep
+│   └── ionogram.py         #    sweep analysis + frequency vs virtual height map
+│       └── corr/radar_corr_autoprobe.py   # correlation / coherent integration
+│
 ├── main.c                  # Firmware: serial command interface, sequencer offsets
 ├── bpsk_tx.c / bpsk_tx.h   # BPSK transmitter: DDS, LUT, PIO/DMA, GPIO events
 ├── CMakeLists.txt          # Build configuration
-├── ionosonde_auto.py       # Unattended TX + RTL-SDR RX + analysis loop
-├── ionosonde_auto_gui.py   # GUI for the automatic sounding loop
-├── ionogram.py             # Sweep analysis + frequency vs virtual height map
-├── corr/                   # Correlation / coherent integration analysis
-├── tests/                  # Test suite (no hardware required)
 └── img/                    # Measurement plots and documentation images
 ```
 
