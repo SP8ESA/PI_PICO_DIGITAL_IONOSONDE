@@ -27,7 +27,9 @@ import argparse
 import json
 import os
 import re
+import collections
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -70,6 +72,110 @@ def progress(text="", seconds=None, done=None, total=None):
     neither  - busy with an open-ended job; empty text clears the bar.
     """
     pass
+
+
+# =========================================================
+#  Audible alarm - a link that dies unattended is otherwise silent
+# =========================================================
+
+class Beeper:
+    """Repeating beep while the transmitter is missing.
+
+    An unattended sounder that loses its Pico keeps looking busy: the sweep runs,
+    the bars move, and every capture is noise. The point of this is to be heard
+    from the next room, so it keeps beeping until the link is back rather than
+    chirping once.
+    """
+
+    PLAYERS = (("paplay", []), ("aplay", ["-q"]), ("pw-play", []))
+
+    def __init__(self, enabled=True, freq_hz=880.0, beep_s=0.18, gap_s=0.55):
+        self.enabled = bool(enabled)
+        self.freq_hz, self.beep_s, self.gap_s = freq_hz, beep_s, gap_s
+        self._thread = None
+        self._stop = threading.Event()
+        self._wav = None
+        self._cmd = None
+        self.reason = ""
+
+    # -- one short tone on disk, played over and over
+    def _tone_file(self):
+        if self._wav and os.path.exists(self._wav):
+            return self._wav
+        import tempfile
+        fs = 44100
+        n = int(fs * self.beep_s)
+        t = np.arange(n) / fs
+        env = np.minimum(1.0, np.minimum(t, self.beep_s - t) / 0.008)   # no clicks
+        pcm = (0.6 * env * np.sin(2 * np.pi * self.freq_hz * t) * 32767).astype("<i2")
+        fd, path = tempfile.mkstemp(prefix="ionosonde_beep_", suffix=".wav")
+        os.close(fd)
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(fs)
+            w.writeframes(pcm.tobytes())
+        self._wav = path
+        return path
+
+    def _player_cmd(self):
+        if self._cmd is not None:
+            return self._cmd
+        for exe, args in self.PLAYERS:
+            path = shutil.which(exe)
+            if path:
+                self._cmd = [path] + args
+                break
+        else:
+            self._cmd = []
+        return self._cmd
+
+    def _loop(self):
+        cmd = self._player_cmd()
+        wav = None
+        if cmd:
+            try:
+                wav = self._tone_file()
+            except Exception:
+                cmd = []
+        while not self._stop.is_set():
+            try:
+                if cmd and wav:
+                    subprocess.run(cmd + [wav], timeout=5,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                else:
+                    sys.stderr.write("\a")     # terminal bell, last resort
+                    sys.stderr.flush()
+            except Exception:
+                pass
+            self._stop.wait(self.gap_s)
+
+    def start(self, reason=""):
+        if not self.enabled or (self._thread and self._thread.is_alive()):
+            return
+        self.reason = reason
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="beeper")
+        self._thread.start()
+        log(f"   *** ALARM: {reason} - beeping until it is back ***")
+
+    def stop(self, note=""):
+        if not (self._thread and self._thread.is_alive()):
+            return
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._thread = None
+        if note:
+            log(f"   alarm off: {note}")
+
+    @property
+    def active(self):
+        return bool(self._thread and self._thread.is_alive())
+
+
+ALARM = Beeper()
 
 
 # =========================================================
@@ -649,6 +755,12 @@ def tx_budget(cfg):
             "duty": on_s / frame_s if frame_s > 0 else 0.0}
 
 
+def ig_coh_batch(analyze_args):
+    """The coherent batch the analysis will use - the rolling pass length."""
+    import ionogram as ig
+    return int(ig.parse_analysis_args(analyze_args).coh_batch)
+
+
 def s2s_from_range(range_km, overhead_us):
     """Chip interval giving the asked unambiguous radar range.
 
@@ -678,9 +790,15 @@ def pico_healthy(pico, why=""):
             pico.ok = False
         if pico.alive():
             pico.silent_frames = 0
+            ALARM.stop("transmitter is answering again")
             return True
+        # Sound the alarm before recovery, not after it fails: reopening the port
+        # and resetting the USB bus can take a minute, and that is exactly the
+        # minute somebody should be walking over to look at the rig.
+        ALARM.start(f"lost the transmitter{why}")
         if pico.recover():
             pico.silent_frames = 0
+            ALARM.stop("transmitter recovered")
             return True
     except Exception as e:
         log(f"   TX: health check failed: {type(e).__name__}: {e}")
@@ -1069,6 +1187,254 @@ def run_ionogram(rx, pico, cfg, stop_evt=None):
     return png
 
 
+def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
+    """Repeated shallow sweeps, averaged into one map that updates as it goes.
+
+    The deep sweep spends every pulse on one frequency before moving on: with
+    2048 chips and a coherent batch of 256 that is eight batches stacked at a
+    single frequency, and nothing at all is drawable until the whole band has
+    been recorded and analysed. Here one pass spends a single batch per
+    frequency, so the map covers the band immediately and deepens as passes
+    accumulate; past `depth` passes the oldest is dropped as the newest lands.
+
+    Analysis runs in a worker thread, so a capture is being crunched while the
+    next frequency is already on the air, and the map is rewritten after every
+    single sounding.
+    """
+    import copy
+    import queue
+    import ionogram as ig
+
+    freqs = sweep_plan(cfg.ion_start * 1e6, cfg.ion_stop * 1e6, cfg.ion_step_khz * 1e3)
+    ap = ig.parse_analysis_args(cfg.analyze_args)
+    pass_chips = int(getattr(cfg, "ion_pass_chips", 0) or ap.coh_batch)
+    depth = int(getattr(cfg, "ion_depth", 0)
+                or max(1, int(round(cfg.chips / max(1, pass_chips)))))
+    passes_wanted = int(getattr(cfg, "ion_passes", 0) or 0)
+
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
+    session = os.path.join(cfg.out_dir, "rolling", f"rolling_{stamp}")
+    raw_dir = os.path.join(session, "captures")
+    os.makedirs(raw_dir, exist_ok=True)
+    stem = os.path.join(session, "ionogram")
+
+    rec_cfg = copy.copy(cfg)
+    rec_cfg.out_dir = raw_dir
+    rec_cfg.no_analyze = True          # the worker does it, off the critical path
+    rec_cfg.keep_wav = True
+    rec_cfg.chips = pass_chips
+
+    frame_s = frame_seconds(rec_cfg) if pico else cfg.rx_seconds
+    per_step_s = cfg.settle_ms / 1e3 + frame_s + cfg.tail_ms / 1e3 + 1.5
+    title = (f"Rolling ionogram {freqs[0]/1e6:.2f}-{freqs[-1]/1e6:.2f} MHz")
+
+    log(f"=== ROLLING IONOGRAM: {len(freqs)} frequencies "
+        f"{freqs[0]/1e6:.3f} - {freqs[-1]/1e6:.3f} MHz, step {cfg.ion_step_khz:.0f} kHz ===")
+    log(f"    {pass_chips} chips per frequency per pass, averaging {depth} passes "
+        f"({depth * pass_chips} chips deep once full)")
+    log(f"    one pass ~{len(freqs)*per_step_s/60:.1f} min; "
+        f"{'endless' if passes_wanted == 0 else str(passes_wanted) + ' passes'}")
+    log(f"    map and raw I/Q in {session}")
+
+    roll = ig.RollingIonogram(freqs, depth, cfg.ion_km_min, cfg.ion_km_max)
+    roll_lock = threading.Lock()
+
+    # Analysis must keep up with the air, not throttle it. One capture takes a
+    # few seconds to crunch and the numpy/scipy inner loops drop the GIL, so a
+    # small pool of threads absorbs the load; the sweep only ever slows down if
+    # the pool itself falls behind, and then it says so.
+    n_workers = int(getattr(cfg, "ion_workers", 0)
+                    or max(1, min(4, (os.cpu_count() or 2) - 1)))
+    backlog_cap = max(2 * n_workers, 4)
+
+    pend = collections.deque()                 # (freq, meta, tag) waiting to be run
+    cv = threading.Condition()
+    dirty = threading.Event()
+    quit_evt = threading.Event()
+    state = {"png": None, "newest": None, "ok": 0, "bad": 0,
+             "dropped": 0, "busy": 0, "peak_backlog": 0}
+
+    def submit(item):
+        """Hand a capture to the pool, dropping the stalest one if we are behind."""
+        with cv:
+            if len(pend) >= backlog_cap:
+                old_f, old_meta, old_tag = pend.popleft()
+                state["dropped"] += 1
+                w = old_meta.get("wav_path")
+                if w and not cfg.keep_wav:
+                    try:
+                        os.remove(w)
+                    except OSError:
+                        pass
+                log(f"   analysis is behind - dropped {old_tag} {old_f/1e6:.3f} MHz "
+                    f"(backlog {len(pend)+1}/{backlog_cap}); a rolling pass will "
+                    f"cover it again shortly")
+            pend.append(item)
+            state["peak_backlog"] = max(state["peak_backlog"], len(pend))
+            cv.notify()
+
+    def analyse_one(freq, meta, tag):
+        wav = meta.get("wav_path")
+        try:
+            km, db, info = ig.profile_from_wav(wav, ap, meta)
+            n_exp = int(info.get("n_expected") or 0)
+            if n_exp and int(info.get("n_found") or 0) != n_exp:
+                raise RuntimeError(
+                    f"only {info.get('n_found')}/{n_exp} chips accounted for")
+            if cfg.detrend_km > 0:
+                db = ig.detrend_profile(km, db, cfg.detrend_km)
+            with roll_lock:
+                roll.add(freq, km, db)
+                state["ok"] += 1
+                u = meta.get("utc")
+                if u and (state["newest"] is None or u > state["newest"]):
+                    state["newest"] = u
+            log(f"   {tag} {freq/1e6:7.3f} MHz folded in "
+                f"({info['n_found']}/{info['n_expected']} pulses)")
+        except Exception as e:
+            with roll_lock:
+                roll.miss(freq)
+                state["bad"] += 1
+            log(f"   {tag} {freq/1e6:7.3f} MHz analysis FAILED: {e}")
+        finally:
+            if wav and not cfg.keep_wav:
+                try:
+                    os.remove(wav)
+                except OSError:
+                    pass
+            dirty.set()
+
+    def worker():
+        while True:
+            with cv:
+                while not pend and not quit_evt.is_set():
+                    cv.wait(0.25)
+                if not pend:
+                    return                     # drained and told to finish
+                item = pend.popleft()
+                state["busy"] += 1
+            try:
+                analyse_one(*item)
+            finally:
+                with cv:
+                    state["busy"] -= 1
+                    cv.notify_all()
+
+    def redraw(final=False):
+        with roll_lock:
+            f_hz, km_axis, M = roll.matrix()
+            footer = roll.footer()
+            newest = state["newest"]
+        if not np.isfinite(M).any():
+            return
+        subtitle = ig.fmt_stamp(newest)
+        try:
+            png = ig.plot_ionogram(f_hz, km_axis, M, stem + ".png",
+                                   title=title, subtitle=subtitle, footer=footer)
+            ig.save_data(stem + ".npz", f_hz, km_axis, M,
+                         meta={"title": title, "subtitle": subtitle,
+                               "footer": footer, "depth": depth,
+                               "pass_chips": pass_chips})
+            state["png"] = png
+            if on_update:
+                on_update(png)
+        except Exception as e:
+            log(f"   redraw failed: {type(e).__name__}: {e}")
+
+    def plotter():
+        """One drawer, never more. Results that land while a plot is being
+        rendered are coalesced into the next one, so drawing can never become
+        the thing that falls behind."""
+        while not quit_evt.is_set():
+            if dirty.wait(0.25):
+                dirty.clear()
+                redraw()
+        if dirty.is_set():
+            dirty.clear()
+            redraw(final=True)
+
+    pool = [threading.Thread(target=worker, daemon=True, name=f"analysis-{k+1}")
+            for k in range(n_workers)]
+    for t in pool:
+        t.start()
+    drawer = threading.Thread(target=plotter, daemon=True, name="plotter")
+    drawer.start()
+    log(f"    {n_workers} analysis thread(s), backlog cap {backlog_cap} captures")
+
+    seq = 0
+    n_pass = 0
+    recoveries = 0
+    stopped = False
+    try:
+        while not stopped and (passes_wanted == 0 or n_pass < passes_wanted):
+            n_pass += 1
+            log(f"########## PASS {n_pass}"
+                f"{'' if passes_wanted == 0 else '/' + str(passes_wanted)} ##########")
+            idx = 0
+            while idx < len(freqs):
+                if stop_evt is not None and stop_evt.is_set():
+                    log("rolling ionogram: stopped on request")
+                    stopped = True
+                    break
+                i, f = idx + 1, freqs[idx]
+                if not pico_healthy(pico, " during the rolling sweep"):
+                    recoveries += 1
+                    if recoveries > cfg.max_recoveries:
+                        log(f"=== stopped: transmitter did not come back after "
+                            f"{cfg.max_recoveries} attempts ===")
+                        stopped = True
+                        break
+                    log(f"   retrying {f/1e6:.3f} MHz after recovery "
+                        f"({recoveries}/{cfg.max_recoveries})")
+                    continue
+                seq += 1
+                with cv:
+                    queued = len(pend)
+                progress(done=idx, total=len(freqs),
+                         text=f"pass {n_pass} - step {i}/{len(freqs)} "
+                              f"({f/1e6:.3f} MHz)"
+                              + (f", {queued} waiting" if queued else ""))
+                try:
+                    meta = sound_once(rx, pico, rec_cfg, f, seq)
+                except Exception as e:
+                    log(f"   recording FAILED: {type(e).__name__}: {e}")
+                    meta = None
+                if meta and meta.get("wav_path"):
+                    submit((f, meta, f"[p{n_pass} {i}/{len(freqs)}]"))
+                elif pico is not None and not pico.alive():
+                    continue           # dead link: redo this very frequency
+                idx += 1
+    finally:
+        progress(text="finishing the analysis backlog")
+        with cv:
+            cv.notify_all()
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            with cv:
+                left = len(pend) + state["busy"]
+            if left == 0:
+                break
+            time.sleep(0.2)
+        quit_evt.set()
+        with cv:
+            cv.notify_all()
+        for t in pool:
+            t.join(timeout=30)
+        drawer.join(timeout=60)
+        redraw(final=True)
+        progress()
+
+    log(f"=== rolling ionogram finished: {n_pass} pass(es), "
+        f"{state['ok']} soundings folded in, {state['bad']} failed"
+        + (f", {state['dropped']} dropped to keep up" if state["dropped"] else "")
+        + " ===")
+    if state["dropped"]:
+        log(f"    analysis could not keep up (peak backlog {state['peak_backlog']}): "
+            f"raise --ion-workers, widen --ion-step-khz or lower --coh_batch")
+    log(f"    {state['png'] or stem + '.png'}")
+    return state["png"]
+
+
 _SERIES = {"n": 0, "total": 0}
 
 
@@ -1252,6 +1618,24 @@ def parse_args():
     g.add_argument("--ion-km-min", type=float, default=100.0, help="map bottom [km]")
     g.add_argument("--ion-km-max", type=float, default=650.0, help="map top [km]")
 
+    g = ap.add_argument_group("rolling ionogram")
+    g.add_argument("--ion-rolling", action="store_true",
+                   help="sweep the band shallow and repeatedly instead of deep "
+                        "once: one coherent batch per frequency per pass, the "
+                        "passes averaged, the map redrawn after every sounding")
+    g.add_argument("--ion-pass-chips", type=int, default=0,
+                   help="chips per frequency per pass (0 = one coherent batch)")
+    g.add_argument("--ion-depth", type=int, default=0,
+                   help="how many passes are averaged before the oldest is "
+                        "dropped (0 = chips / coherent batch)")
+    g.add_argument("--ion-passes", type=int, default=0,
+                   help="how many passes to run, 0 = until stopped")
+    g.add_argument("--ion-workers", type=int, default=0,
+                   help="analysis threads running alongside the sweep "
+                        "(0 = one per spare CPU core, max 4)")
+    g.add_argument("--no-alarm", dest="alarm", action="store_false", default=True,
+                   help="do not beep when the transmitter goes missing")
+
     g = ap.add_argument_group("diagnostics")
     g.add_argument("--list-devices", action="store_true", help="list SoapySDR devices")
 
@@ -1260,8 +1644,10 @@ def parse_args():
         ap.error("nothing to do: enable --tx, --rx or both")
     cfg.no_tx = not cfg.tx                    # legacy names used inside
     cfg.tx_only = cfg.tx and not cfg.rx
-    if cfg.ionogram and not cfg.rx:
+    if (cfg.ionogram or cfg.ion_rolling) and not cfg.rx:
         ap.error("an ionogram needs the receiver: drop --no-rx")
+    if cfg.ion_rolling:
+        cfg.ionogram = True                   # same sweep settings, different loop
     if cfg.s2s is None:                       # range is the knob, S2S follows
         cfg.s2s = int(round(s2s_from_range(cfg.range_km, cfg.chip_overhead_us)))
     chip_us = CODE_LEN.get(str(cfg.mod).upper(), 13) * cfg.bit_us
@@ -1303,6 +1689,7 @@ def main():
         return do_list_devices()
 
     validate(cfg)
+    ALARM.enabled = bool(getattr(cfg, "alarm", True))
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     # TX first: it fails fast and cheaply, before the dongle is reconfigured
@@ -1345,10 +1732,14 @@ def main():
 
     if cfg.ionogram:
         try:
-            run_ionogram_series(rx, pico, cfg)
+            if cfg.ion_rolling:
+                run_ionogram_rolling(rx, pico, cfg)
+            else:
+                run_ionogram_series(rx, pico, cfg)
         except KeyboardInterrupt:
             log("Ctrl+C - shutting down")
         finally:
+            ALARM.stop()
             if pico:
                 pico.stop_auto()
                 pico.close()

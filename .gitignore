@@ -28,3 +28,6 @@ Thumbs.db
 
 # Local test suite (kept on disk, not in git)
 tests/
+
+# GUI preferences (theme choice)
+.gui_prefs.json

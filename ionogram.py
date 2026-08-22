@@ -16,11 +16,14 @@ so a column of the ionogram is exactly the curve you would get from one
 """
 
 import argparse
+import ast
 import os
 import shlex
 import sys
 import time
+import warnings
 import wave
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -449,6 +452,106 @@ def _seq_len(mod):
 #  Assemble and draw
 # =========================================================
 
+def fmt_stamp(iso_utc):
+    """'2026-08-22T17:08:50Z' -> '2026-08-22 17:08 UTC'."""
+    if not iso_utc:
+        return None
+    txt = str(iso_utc).replace("T", " ").replace("Z", "").strip()
+    return txt[:16] + " UTC"
+
+
+def first_capture_utc(folder):
+    """When the sweep actually started, from the earliest capture sidecar."""
+    import glob
+    import json
+    stamps = []
+    for js in glob.glob(os.path.join(folder, "*.json")):
+        try:
+            with open(js) as f:
+                u = json.load(f).get("utc")
+            if u:
+                stamps.append(str(u))
+        except (OSError, ValueError):
+            continue
+    return fmt_stamp(min(stamps)) if stamps else None
+
+
+class RollingIonogram:
+    """A map built from repeated shallow sweeps instead of one deep pass.
+
+    The deep sweep spends all its pulses on one frequency before moving on, so
+    the low end of the band is minutes older than the high end and nothing is
+    drawable until the whole sweep has been analysed. Here each pass spends only
+    one coherent batch per frequency and the passes are averaged, so the map
+    covers the whole band from the first pass and simply gets quieter as more
+    arrive.
+
+    Averaging is done in power, not in dB: these are incoherent looks at the same
+    echo, and the mean of the logs is not the log of the mean.
+
+    Once `depth` passes are held for a frequency the oldest is dropped as the
+    newest lands, so the map keeps sliding forward in time rather than restarting.
+    """
+
+    def __init__(self, freqs_hz, depth, km_min=100.0, km_max=650.0, n_bins=500):
+        self.freqs = np.asarray(sorted(float(f) for f in freqs_hz), dtype=float)
+        self._slot = {int(round(f)): j for j, f in enumerate(self.freqs)}
+        self.depth = max(1, int(depth))
+        self.km = np.linspace(km_min, km_max, n_bins)
+        self.ring = [deque(maxlen=self.depth) for _ in self.freqs]
+        self.added = 0
+        self.failed = 0
+
+    def slot(self, freq_hz):
+        j = self._slot.get(int(round(float(freq_hz))))
+        if j is not None:
+            return j
+        if self.freqs.size == 0:            # tolerate float drift off the grid
+            return None
+        k = int(np.argmin(np.abs(self.freqs - float(freq_hz))))
+        step = np.min(np.diff(self.freqs)) if self.freqs.size > 1 else 1e3
+        return k if abs(self.freqs[k] - float(freq_hz)) <= max(step / 2.0, 1.0) else None
+
+    def add(self, freq_hz, km, db):
+        """Fold one pass of one frequency into the average. Returns its column."""
+        j = self.slot(freq_hz)
+        if j is None:
+            return None
+        prof = np.interp(self.km, km, db, left=np.nan, right=np.nan)
+        self.ring[j].append(np.power(10.0, prof / 10.0))
+        self.added += 1
+        return j
+
+    def miss(self, freq_hz):
+        """A pass that failed to analyse: the column keeps whatever it had."""
+        self.failed += 1
+        return self.slot(freq_hz)
+
+    def counts(self):
+        return np.array([len(d) for d in self.ring], dtype=int)
+
+    def matrix(self):
+        M = np.full((self.km.size, self.freqs.size), np.nan)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN edge bins
+            for j, dq in enumerate(self.ring):
+                if not dq:
+                    continue                # never sounded yet - stays a grey gap
+                mean = np.nanmean(np.stack(dq), axis=0)
+                M[:, j] = 10.0 * np.log10(np.maximum(mean, 1e-30))
+        return self.freqs, self.km, M
+
+    def footer(self):
+        c = self.counts()
+        done = int((c > 0).sum())
+        if done == 0:
+            return "waiting for the first sounding"
+        lo, hi = int(c[c > 0].min()), int(c.max())
+        span = f"{lo}" if lo == hi else f"{lo}-{hi}"
+        return (f"{done}/{c.size} frequencies, averaging {span} of {self.depth} "
+                f"passes")
+
+
 def build_matrix(columns, km_min, km_max, n_bins=500):
     """columns: list of (freq_hz, km, db). Returns freqs, km_axis, matrix[km, freq]."""
     freqs = np.array([c[0] for c in columns], dtype=float)
@@ -474,7 +577,7 @@ def auto_levels(M):
 
 
 def plot_ionogram(freqs_hz, km_axis, M, out_png, title=None, subtitle=None,
-                  vmin=None, vmax=None):
+                  vmin=None, vmax=None, footer=None):
     """Sequential single-ramp heat map: magnitude, so no rainbow, no dual axis."""
     finite = M[np.isfinite(M)]
     if finite.size == 0:
@@ -519,7 +622,7 @@ def plot_ionogram(freqs_hz, km_axis, M, out_png, title=None, subtitle=None,
     ax.tick_params(length=3, color="#999")
 
     n_ok = int(np.isfinite(M).any(axis=0).sum())
-    ax.annotate(f"{n_ok}/{len(f_mhz)} frequencies analysed",
+    ax.annotate(footer or f"{n_ok}/{len(f_mhz)} frequencies analysed",
                 xy=(0.005, -0.115), xycoords="axes fraction",
                 fontsize=8, color="#666")
 
@@ -605,16 +708,33 @@ def save_data(npz_path, freqs_hz, km_axis, M, meta=None):
     return npz_path
 
 
-def load_data(npz_path):
+def load_data(npz_path, with_meta=False):
     d = np.load(npz_path, allow_pickle=True)
-    return d["freqs_hz"], d["km"], d["db"]
+    if not with_meta:
+        return d["freqs_hz"], d["km"], d["db"]
+    meta = {}
+    if "meta" in d.files:
+        try:
+            meta = ast.literal_eval(str(d["meta"][0]))
+        except (ValueError, SyntaxError):
+            meta = {}
+    return d["freqs_hz"], d["km"], d["db"], (meta if isinstance(meta, dict) else {})
 
 
-def replot(npz_path, out_png=None, vmin=None, vmax=None, title=None, subtitle=None):
-    """Redraw a saved ionogram with a different colour range - no re-analysis."""
-    freqs, km, M = load_data(npz_path)
+def replot(npz_path, out_png=None, vmin=None, vmax=None, title=None, subtitle=None,
+           footer=None):
+    """Redraw a saved ionogram with a different colour range - no re-analysis.
+
+    The timestamp and the footer come back from the .npz unless overridden, so
+    dragging the colour sliders cannot silently strip the sounding time off a map.
+    """
+    freqs, km, M, meta = load_data(npz_path, with_meta=True)
     out_png = out_png or os.path.splitext(npz_path)[0] + ".png"
-    return plot_ionogram(freqs, km, M, out_png, title=title, subtitle=subtitle,
+    return plot_ionogram(freqs, km, M, out_png,
+                         title=title if title is not None else meta.get("title"),
+                         subtitle=subtitle if subtitle is not None
+                         else meta.get("subtitle"),
+                         footer=footer if footer is not None else meta.get("footer"),
                          vmin=vmin, vmax=vmax)
 
 
@@ -624,7 +744,7 @@ def replot(npz_path, out_png=None, vmin=None, vmax=None, title=None, subtitle=No
 
 def analyse_folder(folder, analyze_args="", km_min=100.0, km_max=650.0,
                    log=print, keep_wav=True, stop_evt=None, title=None,
-                   detrend_km=0.0, progress=None, out_stem=None):
+                   detrend_km=0.0, progress=None, out_stem=None, stamp_utc=None):
     """Build an ionogram from every capture in a folder (uses the .json sidecars
     for the transmit frequency, falls back to the file name)."""
     import glob
@@ -697,10 +817,14 @@ def analyse_folder(folder, analyze_args="", km_min=100.0, km_max=650.0,
     freqs, km_axis, M = build_matrix(columns, km_min, km_max)
     stem = out_stem or os.path.join(folder, "ionogram")
     os.makedirs(os.path.dirname(stem) or ".", exist_ok=True)
+    # The stamp is when the sounding ran, not when the plot happened to be drawn:
+    # re-analysing a week-old sweep must not relabel it with today's date.
+    subtitle = stamp_utc or first_capture_utc(folder) \
+        or datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     png = plot_ionogram(freqs, km_axis, M, stem + ".png",
-                        title=title or "Ionogram",
-                        subtitle=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
-    save_data(stem + ".npz", freqs, km_axis, M)
+                        title=title or "Ionogram", subtitle=subtitle)
+    save_data(stem + ".npz", freqs, km_axis, M,
+              meta={"title": title or "Ionogram", "subtitle": subtitle})
     log(f"ionogram: {png}")
     return png, freqs, km_axis, M
 

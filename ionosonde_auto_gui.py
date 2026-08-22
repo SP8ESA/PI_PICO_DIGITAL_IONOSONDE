@@ -13,6 +13,7 @@ entry to bring its plot back.
 
 import contextlib
 import io
+import json
 import os
 import queue
 import subprocess
@@ -82,10 +83,153 @@ class AutoGUI:
             'ion_step_khz': tk.DoubleVar(value=100.0),
             'ion_repeat': tk.IntVar(value=1),
             'ion_period': tk.DoubleVar(value=0.0),
+            'ion_rolling': tk.BooleanVar(value=False),
+            'ion_pass_chips': tk.IntVar(value=0),
+            'ion_depth': tk.IntVar(value=0),
+            'ion_passes': tk.IntVar(value=0),
+            'ion_workers': tk.IntVar(value=0),
+            'alarm': tk.BooleanVar(value=True),
+            'dark': tk.BooleanVar(value=False),
+            'fullscreen': tk.BooleanVar(value=False),
         }
 
         self._build()
+        self._build_menu()
+        self._load_prefs()
+        self._apply_theme()
+        root.bind("<F11>", lambda e: self.toggle_fullscreen())
+        root.bind("<Escape>", lambda e: self.set_fullscreen(False))
         self.root.after(100, self._pump)
+
+    # ---------------------------------------------------------- look and feel
+
+    # Two palettes only, and every colour the widgets need is named here rather
+    # than sprinkled through the layout: a half-themed window is worse than an
+    # unthemed one, because the bits that stay white glare at you in the dark.
+    THEMES = {
+        "light": dict(bg="#f0f0f0", panel="#f0f0f0", fg="#1a1a1a", dim="#555555",
+                      field="#ffffff", field_fg="#1a1a1a", sel="#cfe3ff",
+                      sel_fg="#000000", plot="#f4f4f4", accent="#006600",
+                      trough="#dcdcdc", border="#b8b8b8", base="clam"),
+        "dark": dict(bg="#1e2126", panel="#252a31", fg="#e6e6e6", dim="#9aa0a8",
+                     field="#12151a", field_fg="#e6e6e6", sel="#2f5d8a",
+                     sel_fg="#ffffff", plot="#15181d", accent="#67d67d",
+                     trough="#333941", border="#3c434d", base="clam"),
+    }
+
+    PREFS = os.path.join(HERE, ".gui_prefs.json")
+
+    def _load_prefs(self):
+        try:
+            with open(self.PREFS) as f:
+                d = json.load(f)
+            self.vars['dark'].set(bool(d.get("dark", False)))
+        except (OSError, ValueError):
+            pass
+
+    def _save_prefs(self):
+        try:
+            with open(self.PREFS, "w") as f:
+                json.dump({"dark": bool(self.vars['dark'].get())}, f)
+        except OSError:
+            pass
+
+    def _build_menu(self):
+        bar = tk.Menu(self.root)
+        view = tk.Menu(bar, tearoff=0)
+        view.add_checkbutton(label="Full screen", accelerator="F11",
+                             variable=self.vars['fullscreen'],
+                             command=lambda: self.set_fullscreen(
+                                 self.vars['fullscreen'].get()))
+        view.add_checkbutton(label="Dark theme", variable=self.vars['dark'],
+                             command=self._apply_theme)
+        view.add_separator()
+        view.add_command(label="Quit", command=self.on_close)
+        bar.add_cascade(label="View", menu=view)
+        self.root.config(menu=bar)
+        self.menubar = bar
+        self.view_menu = view
+
+    def set_fullscreen(self, on):
+        self.vars['fullscreen'].set(bool(on))
+        try:
+            self.root.attributes("-fullscreen", bool(on))
+        except tk.TclError:                      # window manager refused it
+            self.root.state("zoomed" if on else "normal")
+
+    def toggle_fullscreen(self):
+        self.set_fullscreen(not self.vars['fullscreen'].get())
+
+    def _apply_theme(self, *_a):
+        t = self.THEMES["dark" if self.vars['dark'].get() else "light"]
+        self.theme = t
+        st = ttk.Style()
+        try:
+            st.theme_use(t["base"])              # clam actually honours colours
+        except tk.TclError:
+            pass
+        self.root.configure(background=t["bg"])
+        st.configure(".", background=t["bg"], foreground=t["fg"],
+                     fieldbackground=t["field"], bordercolor=t["border"],
+                     lightcolor=t["panel"], darkcolor=t["panel"],
+                     troughcolor=t["trough"], insertcolor=t["fg"])
+        st.configure("TFrame", background=t["bg"])
+        st.configure("TLabel", background=t["bg"], foreground=t["fg"])
+        st.configure("TLabelframe", background=t["bg"], foreground=t["fg"])
+        st.configure("TLabelframe.Label", background=t["bg"], foreground=t["fg"])
+        st.configure("TCheckbutton", background=t["bg"], foreground=t["fg"])
+        st.configure("TRadiobutton", background=t["bg"], foreground=t["fg"])
+        st.configure("TButton", background=t["panel"], foreground=t["fg"])
+        st.map("TButton",
+               background=[("active", t["sel"]), ("disabled", t["bg"])],
+               foreground=[("disabled", t["dim"])])
+        for cls in ("TEntry", "TSpinbox", "TCombobox"):
+            st.configure(cls, fieldbackground=t["field"], foreground=t["field_fg"],
+                         background=t["panel"], arrowcolor=t["fg"],
+                         insertcolor=t["fg"])
+            st.map(cls, fieldbackground=[("readonly", t["panel"]),
+                                         ("disabled", t["bg"])],
+                   foreground=[("disabled", t["dim"])])
+        st.configure("TNotebook", background=t["bg"], bordercolor=t["border"])
+        st.configure("TNotebook.Tab", background=t["panel"], foreground=t["fg"],
+                     padding=(10, 4))
+        st.map("TNotebook.Tab", background=[("selected", t["bg"])],
+               foreground=[("selected", t["fg"])])
+        st.configure("TProgressbar", background=t["accent"],
+                     troughcolor=t["trough"], bordercolor=t["border"])
+        st.configure("TScale", background=t["bg"], troughcolor=t["trough"])
+        st.configure("TScrollbar", background=t["panel"],
+                     troughcolor=t["trough"], arrowcolor=t["fg"])
+
+        # plain tk widgets do not follow ttk styles - colour them by hand
+        for w, keys in ((getattr(self, "pcanvas", None), ("background",)),
+                        (getattr(self, "canvas", None), ("background",))):
+            if w is not None:
+                w.configure(background=t["plot"] if w is getattr(self, "canvas", None)
+                            else t["bg"])
+        if getattr(self, "hist", None) is not None:
+            self.hist.configure(background=t["field"], foreground=t["field_fg"],
+                                selectbackground=t["sel"],
+                                selectforeground=t["sel_fg"],
+                                highlightbackground=t["border"])
+        if getattr(self, "log_text", None) is not None:
+            self.log_text.configure(background=t["field"], foreground=t["field_fg"],
+                                    insertbackground=t["fg"],
+                                    selectbackground=t["sel"])
+        for name in ("ion_lbl", "frame_lbl"):
+            lbl = getattr(self, name, None)
+            if lbl is not None:
+                lbl.configure(foreground=t["accent"])
+        if getattr(self, "menubar", None) is not None:
+            for m in (self.menubar, self.view_menu):
+                try:
+                    m.configure(background=t["panel"], foreground=t["fg"],
+                                activebackground=t["sel"],
+                                activeforeground=t["sel_fg"])
+                except tk.TclError:
+                    pass
+        self._save_prefs()
+        self._redraw()
 
     # ---------------------------------------------------------- layout
 
@@ -295,6 +439,26 @@ class AutoGUI:
                   ttk.Spinbox(s, from_=0, to=1440, increment=5,
                               textvariable=v['ion_period'], width=14),
                   "0 = back to back"); r += 1
+        ttk.Checkbutton(s, text="Rolling mode (shallow passes, averaged)",
+                        variable=v['ion_rolling'],
+                        command=self._update_enables).grid(
+                            row=r, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+        r += 1
+        self.roll_rows = []
+        for label, key, hint, hi in (
+                ("Chips per pass:", 'ion_pass_chips', "0 = one coherent batch", 65536),
+                ("Passes averaged:", 'ion_depth', "0 = chips / batch", 256),
+                ("Passes to run:", 'ion_passes', "0 = until stopped", 100000),
+                ("Analysis threads:", 'ion_workers', "0 = auto", 32)):
+            w = ttk.Spinbox(s, from_=0, to=hi, increment=1,
+                            textvariable=v[key], width=14)
+            self._row(s, r, label, w, hint)
+            self.roll_rows.append(w)
+            r += 1
+        ttk.Checkbutton(s, text="Beep if the transmitter goes missing",
+                        variable=v['alarm']).grid(row=r, column=0, columnspan=3,
+                                                  sticky=tk.W)
+        r += 1
         self.ion_lbl = ttk.Label(s, text="", foreground="#006600",
                                  font=('Consolas', 8))
         self.ion_lbl.grid(row=r, column=0, columnspan=3, sticky=tk.W)
@@ -344,6 +508,12 @@ class AutoGUI:
                    width=12).pack(side=tk.LEFT, padx=2)
         ttk.Button(box2, text="Run ionogram", command=self.run_ionogram,
                    width=12).pack(side=tk.LEFT, padx=2)
+        box3 = ttk.Frame(parent)
+        box3.pack(fill=tk.X)
+        ttk.Button(box3, text="Run rolling", command=self.run_rolling,
+                   width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(box3, text="Full screen (F11)",
+                   command=self.toggle_fullscreen, width=14).pack(side=tk.LEFT, padx=2)
         ttk.Button(parent, text="Open output folder",
                    command=self._open_dir).pack(fill=tk.X, pady=(2, 0))
 
@@ -419,6 +589,9 @@ class AutoGUI:
                 (False, True): "RX only - Pico not keyed",
                 (False, False): "nothing enabled"}[(tx, rx)]
         self.enable_lbl.config(text=text)
+        on = tk.NORMAL if self.vars['ion_rolling'].get() else tk.DISABLED
+        for w in getattr(self, "roll_rows", ()):
+            w.configure(state=on)
 
     def _update_frame_label(self):
         """Frame length plus what it costs in RF: peak, energy, mean power."""
@@ -485,7 +658,7 @@ class AutoGUI:
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
 
-    def _build_cfg(self, single=False, ionogram=False):
+    def _build_cfg(self, single=False, ionogram=False, rolling=False):
         """Reuse the CLI parser so GUI and command line cannot drift apart."""
         v = self.vars
         argv = ["ionosonde_auto.py",
@@ -515,7 +688,11 @@ class AutoGUI:
                 "--ion-repeat", str(v['ion_repeat'].get()),
                 "--ion-period", str(v['ion_period'].get()),
                 "--ion-km-min", str(v['km_min'].get()),
-                "--ion-km-max", str(v['km_max'].get())]
+                "--ion-km-max", str(v['km_max'].get()),
+                "--ion-pass-chips", str(v['ion_pass_chips'].get()),
+                "--ion-depth", str(v['ion_depth'].get()),
+                "--ion-passes", str(v['ion_passes'].get()),
+                "--ion-workers", str(v['ion_workers'].get())]
         if v['port'].get().strip():
             argv += ["--port", v['port'].get().strip()]
         if not v['enable_tx'].get():
@@ -530,6 +707,10 @@ class AutoGUI:
         argv += ["--digital-agc" if v['digital_agc'].get() else "--no-digital-agc"]
         if ionogram:
             argv += ["--ionogram"]
+        if rolling:
+            argv += ["--ion-rolling"]
+        if not v['alarm'].get():
+            argv += ["--no-alarm"]
         old, err = sys.argv, io.StringIO()
         try:
             sys.argv = argv
@@ -545,17 +726,33 @@ class AutoGUI:
 
     # ---------------------------------------------------------- run control
 
-    def start(self, single=False, ionogram=False):
+    def start(self, single=False, ionogram=False, rolling=False):
         if self.worker and self.worker.is_alive():
             return
         try:
-            cfg = self._build_cfg(single=single, ionogram=ionogram)
+            cfg = self._build_cfg(single=single, ionogram=ionogram or rolling,
+                                  rolling=rolling)
         except (ValueError, tk.TclError) as e:     # bad or non-numeric field
             messagebox.showerror("Bad parameters", str(e))
             return
-        if ionogram:
+        if ionogram or rolling:
             n = len(ia.sweep_plan(cfg.ion_start * 1e6, cfg.ion_stop * 1e6,
                                   cfg.ion_step_khz * 1e3))
+        if rolling:
+            batch = cfg.ion_pass_chips or ia.ig_coh_batch(cfg.analyze_args)
+            depth = cfg.ion_depth or max(1, int(round(cfg.chips / max(1, batch))))
+            if not messagebox.askokcancel(
+                    "Run rolling ionogram",
+                    f"{n} frequencies from {cfg.ion_start:.3f} to "
+                    f"{cfg.ion_stop:.3f} MHz.\n\n"
+                    f"{batch} chips per frequency per pass, averaging {depth} "
+                    f"passes once full.\nThe map is redrawn after every single "
+                    f"sounding and lands in its own folder under "
+                    f"'{os.path.basename(cfg.out_dir)}/rolling'.\n\n"
+                    f"{'Runs until you press Stop.' if cfg.ion_passes == 0 else f'{cfg.ion_passes} pass(es).'}"
+                    " Start?"):
+                return
+        elif ionogram:
             if not messagebox.askokcancel(
                     "Run ionogram",
                     f"{n} soundings from {cfg.ion_start:.3f} to {cfg.ion_stop:.3f} MHz, "
@@ -567,12 +764,16 @@ class AutoGUI:
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.nb.select(0)
-        mode = ("ionogram" if ionogram else "txonly" if cfg.tx_only else "loop")
+        mode = ("rolling" if rolling else "ionogram" if ionogram
+                else "txonly" if cfg.tx_only else "loop")
         self.worker = threading.Thread(target=self._run, args=(cfg, mode), daemon=True)
         self.worker.start()
 
     def run_ionogram(self):
         self.start(ionogram=True)
+
+    def run_rolling(self):
+        self.start(rolling=True)
 
     def stop(self):
         self.stop_evt.set()
@@ -588,6 +789,7 @@ class AutoGUI:
         try:
             os.makedirs(cfg.out_dir, exist_ok=True)
             ia.validate(cfg)
+            ia.ALARM.enabled = bool(getattr(cfg, "alarm", True))
             if not cfg.no_tx:
                 port = ia.find_serial_port(cfg.port)
                 pico = ia.PicoTx(port, echo=False, requested=cfg.port)
@@ -607,6 +809,14 @@ class AutoGUI:
             rx = ia.RtlRx(cfg.device, cfg.rate, cfg.direct_samp, cfg.gain,
                           cfg.agc, cfg.ppm, cfg.digital_agc)
             rx.open()
+
+            if mode == "rolling":
+                put(("status", "Rolling ionogram: sweeping and averaging..."))
+                ia.run_ionogram_rolling(
+                    rx, pico, cfg, stop_evt=self.stop_evt,
+                    on_update=lambda png: put(("rolling",
+                                               (png, os.path.dirname(png or "")))))
+                return
 
             if mode == "ionogram":
                 put(("status", "Ionogram: recording the sweep..."))
@@ -643,6 +853,7 @@ class AutoGUI:
         except Exception as e:
             put(("error", f"{type(e).__name__}: {e}"))
         finally:
+            ia.ALARM.stop()
             if pico:
                 pico.stop_auto()
                 pico.close()
@@ -670,6 +881,8 @@ class AutoGUI:
                     self._set_progress(**payload)
                 elif kind == "ionogram":
                     self._add_ionogram(*payload)
+                elif kind == "rolling":
+                    self._update_rolling(*payload)
                 elif kind == "error":
                     self.log("ERROR: " + payload)
                     messagebox.showerror("Sounding stopped", payload)
@@ -704,6 +917,39 @@ class AutoGUI:
         self.hist.selection_set(tk.END)
         self._show(meta)
         self.nb.select(0)
+
+    def _update_rolling(self, png, folder):
+        """The rolling map is one live picture, not a stream of results.
+
+        It is redrawn after every sounding, so appending to the history would
+        bury the session under hundreds of identical rows: keep a single entry
+        and refresh it in place.
+        """
+        meta = getattr(self, "_rolling_meta", None)
+        stamp = datetime.utcnow().isoformat(timespec="seconds")
+        if meta is None or meta.get("folder") != folder:
+            meta = {"kind": "ionogram", "rolling": True, "png_path": png,
+                    "folder": folder, "utc": stamp, "n": 0}
+            self._rolling_meta = meta
+            self._rolling_row = self.hist.size()
+            self.history.append(meta)
+            self.hist.insert(tk.END, f"{stamp[11:19]}  ROLLING")
+            self.hist.see(tk.END)
+            self.hist.selection_clear(0, tk.END)
+            self.hist.selection_set(tk.END)
+            self.nb.select(0)
+        meta["png_path"] = png
+        meta["utc"] = stamp
+        meta["n"] = meta.get("n", 0) + 1
+        self.hist.delete(self._rolling_row)
+        self.hist.insert(self._rolling_row,
+                         f"{stamp[11:19]}  ROLLING x{meta['n']}")
+        # only repaint the picture if the user is actually looking at it
+        sel = self.hist.curselection()
+        if not sel or sel[0] == self._rolling_row:
+            self.hist.selection_clear(0, tk.END)
+            self.hist.selection_set(self._rolling_row)
+            self._show(meta)
 
     # ---------------------------------------------------------- progress bar
 
@@ -847,8 +1093,7 @@ class AutoGUI:
         import ionogram as ig
         try:
             ig.replot(npz, meta["png_path"], vmin=vmin, vmax=vmax,
-                      title="Ionogram",
-                      subtitle=meta.get("local", "")[:19].replace("T", " "))
+                      title=None, subtitle=None)      # kept from the .npz
         except Exception as e:
             self.log(f"redraw failed: {e}")
             return
