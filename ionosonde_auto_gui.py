@@ -88,6 +88,7 @@ class AutoGUI:
             'ion_depth': tk.IntVar(value=0),
             'ion_passes': tk.IntVar(value=0),
             'ion_workers': tk.IntVar(value=0),
+            'ion_retries': tk.IntVar(value=1),
             'alarm': tk.BooleanVar(value=True),
             'dark': tk.BooleanVar(value=False),
             'fullscreen': tk.BooleanVar(value=False),
@@ -439,6 +440,14 @@ class AutoGUI:
                   ttk.Spinbox(s, from_=0, to=1440, increment=5,
                               textvariable=v['ion_period'], width=14),
                   "0 = back to back"); r += 1
+        self._row(s, r, "Retries:",
+                  ttk.Spinbox(s, from_=0, to=20, increment=1,
+                              textvariable=v['ion_retries'], width=14),
+                  "re-record a frequency that will not analyse"); r += 1
+        self._row(s, r, "Analysis threads:",
+                  ttk.Spinbox(s, from_=0, to=32, increment=1,
+                              textvariable=v['ion_workers'], width=14),
+                  "0 = auto"); r += 1
         ttk.Checkbutton(s, text="Rolling mode (shallow passes, averaged)",
                         variable=v['ion_rolling'],
                         command=self._update_enables).grid(
@@ -448,8 +457,7 @@ class AutoGUI:
         for label, key, hint, hi in (
                 ("Chips per pass:", 'ion_pass_chips', "0 = one coherent batch", 65536),
                 ("Passes averaged:", 'ion_depth', "0 = chips / batch", 256),
-                ("Passes to run:", 'ion_passes', "0 = until stopped", 100000),
-                ("Analysis threads:", 'ion_workers', "0 = auto", 32)):
+                ("Passes to run:", 'ion_passes', "0 = until stopped", 100000)):
             w = ttk.Spinbox(s, from_=0, to=hi, increment=1,
                             textvariable=v[key], width=14)
             self._row(s, r, label, w, hint)
@@ -698,7 +706,8 @@ class AutoGUI:
                 "--ion-pass-chips", str(v['ion_pass_chips'].get()),
                 "--ion-depth", str(v['ion_depth'].get()),
                 "--ion-passes", str(v['ion_passes'].get()),
-                "--ion-workers", str(v['ion_workers'].get())]
+                "--ion-workers", str(v['ion_workers'].get()),
+                "--ion-retries", str(v['ion_retries'].get())]
         if v['port'].get().strip():
             argv += ["--port", v['port'].get().strip()]
         if not v['enable_tx'].get():
@@ -829,7 +838,9 @@ class AutoGUI:
                 ia.run_ionogram_series(
                     rx, pico, cfg, stop_evt=self.stop_evt,
                     on_done=lambda png: put(("ionogram",
-                                             (png, os.path.dirname(png or "")))))
+                                             (png, os.path.dirname(png or "")))),
+                    on_update=lambda png: put(("rolling",
+                                               (png, os.path.dirname(png or "")))))
                 return
 
             seq = 0

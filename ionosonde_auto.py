@@ -1096,16 +1096,177 @@ def sweep_plan(start_hz, stop_hz, step_hz):
     return [start_hz + i * step_hz for i in range(n)]
 
 
-def run_ionogram(rx, pico, cfg, stop_evt=None):
-    """Phase 1 records every frequency, phase 2 analyses them, phase 3 draws.
+class AnalysisPool:
+    """Crunch captures while the next frequency is already on the air.
 
-    Recording first keeps the sweep short, so the whole ionogram describes one
-    state of the ionosphere instead of smearing the analysis time into it.
+    Recording is the part that must not be delayed - the transmitter and the
+    ionosphere do not wait - so analysis runs beside it rather than after it.
+    A small pool absorbs the load (the numpy/scipy inner loops drop the GIL),
+    and exactly one thread draws, coalescing results that land while a plot is
+    being rendered so that drawing can never become the bottleneck.
+
+    If the pool still cannot keep up, the stalest queued capture is dropped
+    rather than blocking the transmitter or filling the disk. Callers that must
+    not lose a frequency get it back through `failed` and can re-record it.
+    """
+
+    def __init__(self, ap, redraw, detrend_km=0.0, keep_wav=False, workers=0,
+                 on_ok=None, on_fail=None):
+        import ionogram as ig
+        self.ig = ig
+        self.ap = ap
+        self.redraw = redraw
+        self.detrend_km = detrend_km
+        self.keep_wav = keep_wav
+        self.on_ok = on_ok
+        self.on_fail = on_fail
+        self.workers = int(workers or max(1, min(4, (os.cpu_count() or 2) - 1)))
+        self.cap = max(2 * self.workers, 4)
+
+        self._pend = collections.deque()
+        self._cv = threading.Condition()
+        self._dirty = threading.Event()
+        self._quit = threading.Event()
+        self._busy = 0
+        self.ok = 0
+        self.bad = 0
+        self.dropped = 0
+        self.peak_backlog = 0
+        self.failed = []                 # frequencies worth another attempt
+
+        self._pool = [threading.Thread(target=self._worker, daemon=True,
+                                       name=f"analysis-{k+1}")
+                      for k in range(self.workers)]
+        for t in self._pool:
+            t.start()
+        self._drawer = threading.Thread(target=self._plotter, daemon=True,
+                                        name="plotter")
+        self._drawer.start()
+
+    # -- producer side
+    def submit(self, freq, meta, tag):
+        with self._cv:
+            if len(self._pend) >= self.cap:
+                of, om, ot = self._pend.popleft()
+                self.dropped += 1
+                self.failed.append(of)
+                self._drop_wav(om)
+                log(f"   analysis is behind - dropped {ot} {of/1e6:.3f} MHz "
+                    f"(backlog {len(self._pend)+1}/{self.cap})")
+            self._pend.append((freq, meta, tag))
+            self.peak_backlog = max(self.peak_backlog, len(self._pend))
+            self._cv.notify()
+
+    @property
+    def backlog(self):
+        with self._cv:
+            return len(self._pend) + self._busy
+
+    def drain(self, timeout=900):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.backlog == 0:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def close(self, timeout=900):
+        self.drain(timeout)
+        self._quit.set()
+        with self._cv:
+            self._cv.notify_all()
+        for t in self._pool:
+            t.join(timeout=30)
+        self._drawer.join(timeout=60)
+        self._dirty.clear()
+
+    def request_redraw(self):
+        self._dirty.set()
+
+    # -- internals
+    def _drop_wav(self, meta):
+        w = (meta or {}).get("wav_path")
+        if w and not self.keep_wav:
+            try:
+                os.remove(w)
+            except OSError:
+                pass
+
+    def _analyse(self, freq, meta, tag):
+        try:
+            km, db, info = self.ig.profile_from_wav(meta.get("wav_path"),
+                                                    self.ap, meta)
+            n_exp = int(info.get("n_expected") or 0)
+            if n_exp and int(info.get("n_found") or 0) != n_exp:
+                raise RuntimeError(
+                    f"only {info.get('n_found')}/{n_exp} chips accounted for")
+            if self.detrend_km > 0:
+                db = self.ig.detrend_profile(km, db, self.detrend_km)
+            self.ok += 1
+            if self.on_ok:
+                self.on_ok(freq, km, db, info, meta)
+            log(f"   {tag} {freq/1e6:7.3f} MHz folded in "
+                f"({info['n_found']}/{info['n_expected']} pulses)")
+        except Exception as e:
+            self.bad += 1
+            self.failed.append(freq)
+            if self.on_fail:
+                self.on_fail(freq, str(e))
+            log(f"   {tag} {freq/1e6:7.3f} MHz analysis FAILED: {e}")
+        finally:
+            self._drop_wav(meta)
+            self._dirty.set()
+
+    def _worker(self):
+        while True:
+            with self._cv:
+                while not self._pend and not self._quit.is_set():
+                    self._cv.wait(0.25)
+                if not self._pend:
+                    return
+                item = self._pend.popleft()
+                self._busy += 1
+            try:
+                self._analyse(*item)
+            finally:
+                with self._cv:
+                    self._busy -= 1
+                    self._cv.notify_all()
+
+    def _plotter(self):
+        while not self._quit.is_set():
+            if self._dirty.wait(0.25):
+                self._dirty.clear()
+                try:
+                    self.redraw()
+                except Exception as e:
+                    log(f"   redraw failed: {type(e).__name__}: {e}")
+        if self._dirty.is_set():
+            self._dirty.clear()
+            try:
+                self.redraw()
+            except Exception as e:
+                log(f"   redraw failed: {type(e).__name__}: {e}")
+
+
+def run_ionogram(rx, pico, cfg, stop_evt=None, on_update=None):
+    """One deep sweep, analysed beside the recording instead of after it.
+
+    The sweep itself is unchanged and still runs back to back, so the map still
+    describes one state of the ionosphere; what changed is that each capture is
+    crunched while the next frequency is already on the air, which takes the
+    analysis time off the end of the run instead of adding it.
+
+    A frequency whose capture will not analyse is re-recorded rather than left
+    as a hole in the map - interference that ruined one capture is usually gone
+    a minute later. --ion-retries bounds how many extra attempts each one gets.
     """
     import copy
     import ionogram as ig
 
     freqs = sweep_plan(cfg.ion_start * 1e6, cfg.ion_stop * 1e6, cfg.ion_step_khz * 1e3)
+    ap = ig.parse_analysis_args(cfg.analyze_args)
+    retries = int(getattr(cfg, "ion_retries", 1) or 0)
     frame_s = frame_seconds(cfg) if pico else cfg.rx_seconds
     per_cycle_s = cfg.settle_ms / 1e3 + frame_s + cfg.tail_ms / 1e3 + 1.5
     bytes_each = 4 * cfg.rate * (frame_s + cfg.lead_ms / 1e3 + cfg.tail_ms / 1e3)
@@ -1115,76 +1276,133 @@ def run_ionogram(rx, pico, cfg, stop_evt=None):
     maps_dir = os.path.join(cfg.out_dir, "ionograms")
     os.makedirs(session, exist_ok=True)
     os.makedirs(maps_dir, exist_ok=True)
+    stem = os.path.join(maps_dir, f"ionogram_{stamp}")
+    title = f"Ionogram {freqs[0]/1e6:.2f}-{freqs[-1]/1e6:.2f} MHz"
 
     log(f"=== IONOGRAM: {len(freqs)} frequencies "
         f"{freqs[0]/1e6:.3f} - {freqs[-1]/1e6:.3f} MHz, "
         f"step {cfg.ion_step_khz:.0f} kHz ===")
-    log(f"    recording ~{len(freqs)*per_cycle_s/60:.1f} min, "
+    log(f"    sweep ~{len(freqs)*per_cycle_s/60:.1f} min, "
         f"~{len(freqs)*bytes_each/1e9:.1f} GB of raw I/Q in {session}")
+    log(f"    analysed alongside the sweep; up to {retries} retry/ies per frequency")
     log(f"    the map lands in {maps_dir}, with every other ionogram")
 
-    # ---- phase 1: record everything, no analysis in between
+    # depth 1: one look per frequency, and a frequency never sounded stays a gap
+    grid = ig.RollingIonogram(freqs, 1, cfg.ion_km_min, cfg.ion_km_max)
+    grid_lock = threading.Lock()
+    started = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    def redraw():
+        with grid_lock:
+            f_hz, km_axis, M = grid.matrix()
+            footer = grid.footer()
+        if not np.isfinite(M).any():
+            return
+        subtitle = ig.fmt_stamp(started)
+        png = ig.plot_ionogram(f_hz, km_axis, M, stem + ".png", title=title,
+                               subtitle=subtitle, footer=footer)
+        ig.save_data(stem + ".npz", f_hz, km_axis, M,
+                     meta={"title": title, "subtitle": subtitle, "footer": footer})
+        if on_update:
+            on_update(png)
+
+    def took_it(freq, km, db, _info, _meta):
+        with grid_lock:
+            grid.add(freq, km, db)
+
+    pool = AnalysisPool(ap, redraw, detrend_km=cfg.detrend_km,
+                        keep_wav=cfg.keep_wav,
+                        workers=int(getattr(cfg, "ion_workers", 0) or 0),
+                        on_ok=took_it)
+    log(f"    {pool.workers} analysis thread(s) running alongside the sweep")
+
     rec_cfg = copy.copy(cfg)
     rec_cfg.out_dir = session
     rec_cfg.no_analyze = True
     rec_cfg.keep_wav = True
-    done = 0
-    idx = 0
+
+    seq = 0
     recoveries = 0
-    while idx < len(freqs):
-        if stop_evt is not None and stop_evt.is_set():
-            log("ionogram: recording stopped on request")
-            break
-        i, f = idx + 1, freqs[idx]
+    recorded = 0
+    stopped = False
 
-        # A lost transmitter does not end the sweep any more: recover it (reopen,
-        # USB reset, picotool) and redo this very step, so the map keeps its
-        # frequency grid instead of stopping short.
-        if not pico_healthy(pico, " during the sweep"):
-            recoveries += 1
-            if recoveries > cfg.max_recoveries:
-                log(f"=== sweep stopped at step {i}/{len(freqs)}: transmitter did "
-                    f"not come back after {cfg.max_recoveries} attempts. "
-                    f"{done} captures are kept in {session} ===")
-                break
-            log(f"   retrying step {i}/{len(freqs)} after recovery "
-                f"({recoveries}/{cfg.max_recoveries})")
-            continue
-
-        log(f"[{i}/{len(freqs)}] recording {f/1e6:.3f} MHz")
-        progress(done=idx, total=len(freqs),
-                 text=f"{_series_label()}sweep step {i}/{len(freqs)}")
-        try:
-            if sound_once(rx, pico, rec_cfg, f, i):
-                done += 1
-                idx += 1
+    def sweep(todo, label):
+        """Record every frequency in `todo`, handing each to the pool."""
+        nonlocal seq, recoveries, recorded, stopped
+        idx = 0
+        while idx < len(todo):
+            if stop_evt is not None and stop_evt.is_set():
+                log("ionogram: stopped on request")
+                stopped = True
+                return
+            i, f = idx + 1, todo[idx]
+            if not pico_healthy(pico, " during the sweep"):
+                recoveries += 1
+                if recoveries > cfg.max_recoveries:
+                    log(f"=== sweep stopped at {f/1e6:.3f} MHz: transmitter did "
+                        f"not come back after {cfg.max_recoveries} attempts ===")
+                    stopped = True
+                    return
+                log(f"   retrying {f/1e6:.3f} MHz after recovery "
+                    f"({recoveries}/{cfg.max_recoveries})")
+                continue
+            seq += 1
+            progress(done=idx, total=len(todo),
+                     text=f"{_series_label()}{label} {i}/{len(todo)} "
+                          f"({f/1e6:.3f} MHz)")
+            try:
+                meta = sound_once(rx, pico, rec_cfg, f, seq)
+            except Exception as e:
+                log(f"   recording FAILED: {type(e).__name__}: {e}")
+                meta = None
+            if meta and meta.get("wav_path"):
+                recorded += 1
+                pool.submit(f, meta, f"[{label} {i}/{len(todo)}]")
+            elif pico is not None and not pico.alive():
+                continue                     # dead link: redo this frequency
             else:
-                # the capture aborted (usually a dead link); check and redo
-                if pico is not None and not pico.alive():
-                    continue
-                idx += 1
-        except Exception as e:
-            log(f"   recording FAILED: {type(e).__name__}: {e}")
+                pool.failed.append(f)        # nothing recorded - worth a retry
             idx += 1
-    if done == 0:
-        raise SystemExit("Ionogram: nothing was recorded")
-    if stop_evt is not None and stop_evt.is_set():
-        log(f"=== stopped after {done}/{len(freqs)} captures - they are kept in "
-            f"{session}, analyse them later with 'Re-analyse' ===")
-        return None
-    log(f"=== recording done: {done}/{len(freqs)} captures, starting analysis ===")
 
-    # ---- phase 2 + 3: analyse every capture, then draw the map
-    if pico:
-        pico.stop_auto()                       # keep the PA cold while we crunch
-    png, _f, _km, _M = ig.analyse_folder(
-        session, analyze_args=cfg.analyze_args,
-        km_min=cfg.ion_km_min, km_max=cfg.ion_km_max,
-        log=log, keep_wav=cfg.keep_wav, stop_evt=stop_evt,
-        progress=lambda **kw: progress(**kw), detrend_km=cfg.detrend_km,
-        out_stem=os.path.join(maps_dir, f"ionogram_{stamp}"),
-        title=f"Ionogram {freqs[0]/1e6:.2f}-{freqs[-1]/1e6:.2f} MHz")
-    return png
+    try:
+        sweep(list(freqs), "sweep step")
+        # Analysis lags the sweep, so failures are only all known once it drains.
+        if not stopped:
+            progress(text="finishing the analysis backlog")
+            pool.drain()
+        for attempt in range(1, retries + 1):
+            if stopped or (stop_evt is not None and stop_evt.is_set()):
+                break
+            with grid_lock:
+                missing = [float(f) for f, n in zip(grid.freqs, grid.counts())
+                           if n == 0]
+            pool.failed.clear()
+            if not missing:
+                break
+            log(f"=== retry {attempt}/{retries}: {len(missing)} frequency/ies "
+                f"with no usable profile ===")
+            if pico:
+                pico.stop_auto()
+            sweep(missing, f"retry {attempt}")
+            pool.drain()
+    finally:
+        pool.close()
+        if pico:
+            pico.stop_auto()
+        try:
+            redraw()
+        except Exception as e:
+            log(f"   final redraw failed: {type(e).__name__}: {e}")
+        progress()
+
+    with grid_lock:
+        done = int((grid.counts() > 0).sum())
+    if done == 0:
+        raise SystemExit("Ionogram: nothing analysed")
+    log(f"=== ionogram done: {done}/{len(freqs)} frequencies, "
+        f"{recorded} captures, {pool.bad} analysis failure(s) ===")
+    log(f"    {stem}.png")
+    return stem + ".png"
 
 
 def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
@@ -1247,89 +1465,10 @@ def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
 
     roll = ig.RollingIonogram(freqs, depth, cfg.ion_km_min, cfg.ion_km_max)
     roll_lock = threading.Lock()
+    retries = int(getattr(cfg, "ion_retries", 1) or 0)
+    state = {"png": None, "newest": None}
 
-    # Analysis must keep up with the air, not throttle it. One capture takes a
-    # few seconds to crunch and the numpy/scipy inner loops drop the GIL, so a
-    # small pool of threads absorbs the load; the sweep only ever slows down if
-    # the pool itself falls behind, and then it says so.
-    n_workers = int(getattr(cfg, "ion_workers", 0)
-                    or max(1, min(4, (os.cpu_count() or 2) - 1)))
-    backlog_cap = max(2 * n_workers, 4)
-
-    pend = collections.deque()                 # (freq, meta, tag) waiting to be run
-    cv = threading.Condition()
-    dirty = threading.Event()
-    quit_evt = threading.Event()
-    state = {"png": None, "newest": None, "ok": 0, "bad": 0,
-             "dropped": 0, "busy": 0, "peak_backlog": 0}
-
-    def submit(item):
-        """Hand a capture to the pool, dropping the stalest one if we are behind."""
-        with cv:
-            if len(pend) >= backlog_cap:
-                old_f, old_meta, old_tag = pend.popleft()
-                state["dropped"] += 1
-                w = old_meta.get("wav_path")
-                if w and not cfg.keep_wav:
-                    try:
-                        os.remove(w)
-                    except OSError:
-                        pass
-                log(f"   analysis is behind - dropped {old_tag} {old_f/1e6:.3f} MHz "
-                    f"(backlog {len(pend)+1}/{backlog_cap}); a rolling pass will "
-                    f"cover it again shortly")
-            pend.append(item)
-            state["peak_backlog"] = max(state["peak_backlog"], len(pend))
-            cv.notify()
-
-    def analyse_one(freq, meta, tag):
-        wav = meta.get("wav_path")
-        try:
-            km, db, info = ig.profile_from_wav(wav, ap, meta)
-            n_exp = int(info.get("n_expected") or 0)
-            if n_exp and int(info.get("n_found") or 0) != n_exp:
-                raise RuntimeError(
-                    f"only {info.get('n_found')}/{n_exp} chips accounted for")
-            if cfg.detrend_km > 0:
-                db = ig.detrend_profile(km, db, cfg.detrend_km)
-            with roll_lock:
-                roll.add(freq, km, db)
-                state["ok"] += 1
-                u = meta.get("utc")
-                if u and (state["newest"] is None or u > state["newest"]):
-                    state["newest"] = u
-            log(f"   {tag} {freq/1e6:7.3f} MHz folded in "
-                f"({info['n_found']}/{info['n_expected']} pulses)")
-        except Exception as e:
-            with roll_lock:
-                roll.miss(freq)
-                state["bad"] += 1
-            log(f"   {tag} {freq/1e6:7.3f} MHz analysis FAILED: {e}")
-        finally:
-            if wav and not cfg.keep_wav:
-                try:
-                    os.remove(wav)
-                except OSError:
-                    pass
-            dirty.set()
-
-    def worker():
-        while True:
-            with cv:
-                while not pend and not quit_evt.is_set():
-                    cv.wait(0.25)
-                if not pend:
-                    return                     # drained and told to finish
-                item = pend.popleft()
-                state["busy"] += 1
-            try:
-                analyse_one(*item)
-            finally:
-                with cv:
-                    state["busy"] -= 1
-                    cv.notify_all()
-
-    def redraw(final=False):
+    def redraw():
         with roll_lock:
             f_hz, km_axis, M = roll.matrix()
             footer = roll.footer()
@@ -1340,65 +1479,99 @@ def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
             return
         subtitle = ig.fmt_stamp(newest)
         head = f"{title} - pass {n}"
-        try:
-            png = ig.plot_ionogram(f_hz, km_axis, M, stem + ".png",
-                                   title=head, subtitle=subtitle, footer=footer)
-            ig.save_data(stem + ".npz", f_hz, km_axis, M,
-                         meta={"title": head, "subtitle": subtitle,
-                               "footer": footer, "depth": depth,
-                               "pass_chips": pass_chips, "pass": n})
-            state["png"] = png
-            if on_update:
-                on_update(png)
-        except Exception as e:
-            log(f"   redraw failed: {type(e).__name__}: {e}")
+        png = ig.plot_ionogram(f_hz, km_axis, M, stem + ".png", title=head,
+                               subtitle=subtitle, footer=footer)
+        ig.save_data(stem + ".npz", f_hz, km_axis, M,
+                     meta={"title": head, "subtitle": subtitle, "footer": footer,
+                           "depth": depth, "pass_chips": pass_chips, "pass": n})
+        state["png"] = png
+        if on_update:
+            on_update(png)
 
-    def drain(timeout=600):
-        """Wait for everything already recorded to be folded in."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            with cv:
-                left = len(pend) + state["busy"]
-            if left == 0:
-                return True
-            time.sleep(0.2)
-        return False
+    def took_it(freq, km, db, _info, meta):
+        with roll_lock:
+            roll.add(freq, km, db)
+            u = meta.get("utc")
+            if u and (state["newest"] is None or u > state["newest"]):
+                state["newest"] = u
 
-    def close_pass():
-        """Finish the current pass file so nothing can overwrite it later."""
-        if cur["stem"] is None:
-            return
-        progress(text=f"finishing pass {cur['pass']}")
-        drain()
-        dirty.clear()
-        redraw(final=True)
-        if state["png"]:
-            log(f"   pass {cur['pass']} saved: {os.path.basename(state['png'])}")
-
-    def plotter():
-        """One drawer, never more. Results that land while a plot is being
-        rendered are coalesced into the next one, so drawing can never become
-        the thing that falls behind."""
-        while not quit_evt.is_set():
-            if dirty.wait(0.25):
-                dirty.clear()
-                redraw()
-        if dirty.is_set():
-            dirty.clear()
-            redraw(final=True)
-
-    pool = [threading.Thread(target=worker, daemon=True, name=f"analysis-{k+1}")
-            for k in range(n_workers)]
-    for t in pool:
-        t.start()
-    drawer = threading.Thread(target=plotter, daemon=True, name="plotter")
-    drawer.start()
-    log(f"    {n_workers} analysis thread(s), backlog cap {backlog_cap} captures")
+    pool = AnalysisPool(ap, redraw, detrend_km=cfg.detrend_km,
+                        keep_wav=cfg.keep_wav,
+                        workers=int(getattr(cfg, "ion_workers", 0) or 0),
+                        on_ok=took_it)
+    log(f"    {pool.workers} analysis thread(s), backlog cap {pool.cap} captures, "
+        f"up to {retries} retry/ies per frequency")
 
     seq = 0
     n_pass = 0
     recoveries = 0
     stopped = False
+
+    def sweep(todo, label):
+        """Record every frequency in `todo`, handing each to the pool."""
+        nonlocal seq, recoveries, stopped
+        idx = 0
+        while idx < len(todo):
+            if stop_evt is not None and stop_evt.is_set():
+                log("rolling ionogram: stopped on request")
+                stopped = True
+                return
+            i, f = idx + 1, todo[idx]
+            if not pico_healthy(pico, " during the rolling sweep"):
+                recoveries += 1
+                if recoveries > cfg.max_recoveries:
+                    log(f"=== stopped: transmitter did not come back after "
+                        f"{cfg.max_recoveries} attempts ===")
+                    stopped = True
+                    return
+                log(f"   retrying {f/1e6:.3f} MHz after recovery "
+                    f"({recoveries}/{cfg.max_recoveries})")
+                continue
+            seq += 1
+            progress(done=idx, total=len(todo),
+                     text=f"pass {n_pass} - {label} {i}/{len(todo)} "
+                          f"({f/1e6:.3f} MHz)"
+                          + (f", {pool.backlog} waiting" if pool.backlog else ""))
+            try:
+                meta = sound_once(rx, pico, rec_cfg, f, seq)
+            except Exception as e:
+                log(f"   recording FAILED: {type(e).__name__}: {e}")
+                meta = None
+            if meta and meta.get("wav_path"):
+                pool.submit(f, meta, f"[p{n_pass} {label} {i}/{len(todo)}]")
+            elif pico is not None and not pico.alive():
+                continue                     # dead link: redo this frequency
+            else:
+                pool.failed.append(f)
+            idx += 1
+
+    def close_pass():
+        """Fill the holes, then finish this pass file so nothing overwrites it."""
+        if cur["stem"] is None:
+            return
+        progress(text=f"finishing pass {cur['pass']}")
+        pool.drain()
+        for attempt in range(1, retries + 1):
+            if stopped or (stop_evt is not None and stop_evt.is_set()):
+                break
+            # A frequency is a hole only if it has nothing at all; one that
+            # still holds older passes is not worth re-recording out of turn.
+            with roll_lock:
+                holes = [float(f) for f, n in zip(roll.freqs, roll.counts())
+                         if n == 0]
+            pool.failed.clear()
+            if not holes:
+                break
+            log(f"   pass {cur['pass']} retry {attempt}/{retries}: "
+                f"{len(holes)} empty column(s)")
+            sweep(holes, f"retry {attempt}")
+            pool.drain()
+        pool.request_redraw()
+        time.sleep(0.3)
+        pool.drain()
+        if state["png"]:
+            log(f"   pass {cur['pass']} saved: {os.path.basename(state['png'])}")
+
     try:
         while not stopped and (passes_wanted == 0 or n_pass < passes_wanted):
             n_pass += 1
@@ -1407,62 +1580,23 @@ def run_ionogram_rolling(rx, pico, cfg, stop_evt=None, on_update=None):
             log(f"########## PASS {n_pass}"
                 f"{'' if passes_wanted == 0 else '/' + str(passes_wanted)} "
                 f"-> {os.path.basename(cur['stem'])}.png ##########")
-            idx = 0
-            while idx < len(freqs):
-                if stop_evt is not None and stop_evt.is_set():
-                    log("rolling ionogram: stopped on request")
-                    stopped = True
-                    break
-                i, f = idx + 1, freqs[idx]
-                if not pico_healthy(pico, " during the rolling sweep"):
-                    recoveries += 1
-                    if recoveries > cfg.max_recoveries:
-                        log(f"=== stopped: transmitter did not come back after "
-                            f"{cfg.max_recoveries} attempts ===")
-                        stopped = True
-                        break
-                    log(f"   retrying {f/1e6:.3f} MHz after recovery "
-                        f"({recoveries}/{cfg.max_recoveries})")
-                    continue
-                seq += 1
-                with cv:
-                    queued = len(pend)
-                progress(done=idx, total=len(freqs),
-                         text=f"pass {n_pass} - step {i}/{len(freqs)} "
-                              f"({f/1e6:.3f} MHz)"
-                              + (f", {queued} waiting" if queued else ""))
-                try:
-                    meta = sound_once(rx, pico, rec_cfg, f, seq)
-                except Exception as e:
-                    log(f"   recording FAILED: {type(e).__name__}: {e}")
-                    meta = None
-                if meta and meta.get("wav_path"):
-                    submit((f, meta, f"[p{n_pass} {i}/{len(freqs)}]"))
-                elif pico is not None and not pico.alive():
-                    continue           # dead link: redo this very frequency
-                idx += 1
+            sweep(list(freqs), "step")
             close_pass()
     finally:
         progress(text="finishing the analysis backlog")
-        with cv:
-            cv.notify_all()
-        drain()
-        quit_evt.set()
-        with cv:
-            cv.notify_all()
-        for t in pool:
-            t.join(timeout=30)
-        drawer.join(timeout=60)
-        dirty.clear()
-        redraw(final=True)          # an interrupted pass still keeps its map
+        pool.close()
+        try:
+            redraw()                    # an interrupted pass still keeps its map
+        except Exception as e:
+            log(f"   final redraw failed: {type(e).__name__}: {e}")
         progress()
 
     log(f"=== rolling ionogram finished: {n_pass} pass(es), "
-        f"{state['ok']} soundings folded in, {state['bad']} failed"
-        + (f", {state['dropped']} dropped to keep up" if state["dropped"] else "")
+        f"{pool.ok} soundings folded in, {pool.bad} failed"
+        + (f", {pool.dropped} dropped to keep up" if pool.dropped else "")
         + " ===")
-    if state["dropped"]:
-        log(f"    analysis could not keep up (peak backlog {state['peak_backlog']}): "
+    if pool.dropped:
+        log(f"    analysis could not keep up (peak backlog {pool.peak_backlog}): "
             f"raise --ion-workers, widen --ion-step-khz or lower --coh_batch")
     import glob as _glob
     maps = sorted(_glob.glob(os.path.join(session, "ionogram_p*.png")))
@@ -1484,7 +1618,7 @@ def _series_label():
     return f"ionogram {_SERIES['n']}/{tot} - "
 
 
-def run_ionogram_series(rx, pico, cfg, stop_evt=None, on_done=None):
+def run_ionogram_series(rx, pico, cfg, stop_evt=None, on_done=None, on_update=None):
     """One ionogram after another, each into its own timestamped folder.
 
     Repeating the whole sweep is how you watch the ionosphere move: the layer
@@ -1503,7 +1637,8 @@ def run_ionogram_series(rx, pico, cfg, stop_evt=None, on_done=None):
         log(f"########## IONOGRAM {made}"
             f"{'' if total == 0 else '/' + str(total)} ##########")
         try:
-            png = run_ionogram(rx, pico, cfg, stop_evt=stop_evt)
+            png = run_ionogram(rx, pico, cfg, stop_evt=stop_evt,
+                               on_update=on_update)
             if on_done and png:
                 on_done(png)
         except SystemExit as e:
@@ -1672,6 +1807,10 @@ def parse_args():
     g.add_argument("--ion-workers", type=int, default=0,
                    help="analysis threads running alongside the sweep "
                         "(0 = one per spare CPU core, max 4)")
+    g.add_argument("--ion-retries", type=int, default=1,
+                   help="extra attempts at a frequency whose capture will not "
+                        "analyse, so a failure leaves a filled column instead "
+                        "of a hole (0 = never retry)")
     g.add_argument("--no-alarm", dest="alarm", action="store_false", default=True,
                    help="do not beep when the transmitter goes missing")
 
